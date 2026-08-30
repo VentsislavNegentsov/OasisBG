@@ -48,6 +48,7 @@ import org.osmdroid.views.overlay.Polygon
 import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 import retrofit2.Retrofit
+import com.oasisbg.ui.theme.OasisUrbanTheme
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Field
 import retrofit2.http.FormUrlEncoded
@@ -55,7 +56,7 @@ import retrofit2.http.POST
 import retrofit2.http.Url
 import java.util.concurrent.TimeUnit
 
-// --- 1. Модели за данни, Локализация & Retrofit API ---
+// --- 1. Модели за данни, Кеш, Локализация & Retrofit API ---
 
 enum class AppLanguage { BG, EN }
 
@@ -76,6 +77,13 @@ data class Element(
 }
 
 data class OverpassResponse(val elements: List<Element>)
+
+// Кеш запис за запазване на вече изгледани локации
+data class CachedQueryResult(
+    val category: MapCategory,
+    val center: GeoPoint,
+    val elements: List<Element>
+)
 
 enum class MapCategory(
     val labelBg: String,
@@ -115,7 +123,7 @@ interface OverpassApi {
                 .readTimeout(40, TimeUnit.SECONDS)
                 .addInterceptor { chain ->
                     val request = chain.request().newBuilder()
-                        .header("User-Agent", "OasisBG-MobileApp/2.3 (Android)")
+                        .header("User-Agent", "OasisUrban-MobileApp/2.4 (Android)")
                         .build()
                     chain.proceed(request)
                 }
@@ -214,7 +222,7 @@ class MainActivity : ComponentActivity() {
         Configuration.getInstance().userAgentValue = packageName
 
         setContent {
-            MaterialTheme {
+            OasisUrbanTheme {
                 MainScreen()
             }
         }
@@ -228,6 +236,9 @@ fun MainScreen() {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val api = remember { OverpassApi.create() }
+
+    // Кеш списък за търсенията в текущата сесия
+    val cacheList = remember { mutableStateListOf<CachedQueryResult>() }
 
     var currentLanguage by remember { mutableStateOf(AppLanguage.BG) }
     var selectedCategory by remember { mutableStateOf(MapCategory.FOUNTAINS) }
@@ -276,6 +287,25 @@ fun MainScreen() {
         }
     }
 
+    fun renderElements(elements: List<Element>, category: MapCategory, lang: AppLanguage) {
+        val poiIcon = createEmojiMarkerIcon(context, category.icon, category.colorHex)
+        elements.forEach { element ->
+            val lat = element.actualLat
+            val lon = element.actualLon
+            if (lat != null && lon != null) {
+                val marker = Marker(mapView).apply {
+                    position = GeoPoint(lat, lon)
+                    title = element.tags?.get("name") ?: "${category.icon} ${category.label(lang)}"
+                    snippet = formatSpotDetails(category, element.tags, lang)
+                    icon = poiIcon
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                }
+                mapView.overlays.add(marker)
+            }
+        }
+        mapView.invalidate()
+    }
+
     fun loadData(category: MapCategory, center: GeoPoint, lang: AppLanguage) {
         activeJob?.cancel()
 
@@ -302,6 +332,20 @@ fun MainScreen() {
         mapView.overlays.add(circle)
         mapView.invalidate()
 
+        // --- КЕШ ПРОВЕРКА ---
+        // Ако има търсене в същата категория на разстояние по-малко от 1000м (1км), зареждаме от кеша!
+        val cachedHit = cacheList.firstOrNull { cached ->
+            cached.category == category && center.distanceToAsDouble(cached.center) < 1000.0
+        }
+
+        if (cachedHit != null) {
+            renderElements(cachedHit.elements, category, lang)
+            val msg = if (lang == AppLanguage.BG) "⚡ Заредено моментално от кеша" else "⚡ Loaded instantly from cache"
+            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        // Ако няма кеш, правим заявка към Overpass API
         activeJob = coroutineScope.launch {
             isLoading = true
             try {
@@ -330,15 +374,13 @@ fun MainScreen() {
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         lastException = e
-                        Log.w("OasisBG", "Сървър $serverUrl пропадна: ${e.message}")
+                        Log.w("OasisUrban", "Сървър $serverUrl пропадна: ${e.message}")
                     }
                 }
 
                 val finalResponse = bestResponse ?: throw (lastException ?: Exception(
                     if (lang == AppLanguage.BG) "Няма връзка със сървърите." else "No server connection."
                 ))
-
-                val poiIcon = createEmojiMarkerIcon(context, category.icon, category.colorHex)
 
                 if (finalResponse.elements.isEmpty()) {
                     val msg = if (lang == AppLanguage.BG) {
@@ -348,26 +390,14 @@ fun MainScreen() {
                     }
                     Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                 } else {
-                    finalResponse.elements.forEach { element ->
-                        val lat = element.actualLat
-                        val lon = element.actualLon
-                        if (lat != null && lon != null) {
-                            val marker = Marker(mapView).apply {
-                                position = GeoPoint(lat, lon)
-                                title = element.tags?.get("name") ?: "${category.icon} ${category.label(lang)}"
-                                snippet = formatSpotDetails(category, element.tags, lang)
-                                icon = poiIcon
-                                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                            }
-                            mapView.overlays.add(marker)
-                        }
-                    }
+                    // Записваме резултата в кеша за бъдещи кликове
+                    cacheList.add(CachedQueryResult(category, center, finalResponse.elements))
+                    renderElements(finalResponse.elements, category, lang)
                 }
-                mapView.invalidate()
             } catch (e: CancellationException) {
                 // Игнорира се при ново преместване
             } catch (e: Exception) {
-                Log.e("OasisBG", "Грешка при зареждане", e)
+                Log.e("OasisUrban", "Грешка при зареждане", e)
                 val errPrefix = if (lang == AppLanguage.BG) "Мрежова грешка: " else "Network error: "
                 Toast.makeText(context, "$errPrefix${e.localizedMessage}", Toast.LENGTH_LONG).show()
             } finally {
