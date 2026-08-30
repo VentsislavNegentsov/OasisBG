@@ -54,8 +54,9 @@ import retrofit2.http.FormUrlEncoded
 import retrofit2.http.POST
 import retrofit2.http.Url
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
-// --- 1. Модели за данни, Категории (2 Нива), Локализация & API ---
+// --- 1. Модели за данни, Категории & Кеш ---
 
 enum class AppLanguage { BG, EN }
 
@@ -70,17 +71,33 @@ data class Element(
 ) {
     val actualLat: Double? get() = lat ?: center?.lat
     val actualLon: Double? get() = lon ?: center?.lon
+
+    fun belongsToCategory(category: PoiCategory): Boolean {
+        return tags?.get(category.osmKey) == category.osmValue
+    }
+
+    fun getLocalizedTitle(category: PoiCategory, lang: AppLanguage): String {
+        val nameBg = tags?.get("name:bg")
+        val nameEn = tags?.get("name:en")
+        val nameDefault = tags?.get("name")
+
+        val name = when (lang) {
+            AppLanguage.BG -> nameBg ?: nameDefault
+            AppLanguage.EN -> nameEn ?: nameDefault
+        }
+        return name ?: "${category.icon} ${category.label(lang)}"
+    }
 }
 
 data class OverpassResponse(val elements: List<Element>)
 
-data class CachedQueryResult(
-    val category: PoiCategory,
+// Глобален кеш за цялата сесия на дадена локация и радиус
+data class CachedAreaResult(
     val center: GeoPoint,
+    val radiusKm: Float,
     val elements: List<Element>
 )
 
-// Ниво 1: Главни Групи Категории
 enum class MainCategory(
     val labelBg: String,
     val labelEn: String,
@@ -95,7 +112,6 @@ enum class MainCategory(
     fun label(lang: AppLanguage): String = if (lang == AppLanguage.BG) labelBg else labelEn
 }
 
-// Ниво 2: Конкретни Обекти (POI)
 enum class PoiCategory(
     val mainCategory: MainCategory,
     val labelBg: String,
@@ -105,12 +121,10 @@ enum class PoiCategory(
     val osmValue: String,
     val colorHex: String
 ) {
-    // Вода & Хигиена
     FOUNTAINS(MainCategory.WATER_HYGIENE, "Чешми", "Fountains", "🚰", "amenity", "drinking_water", "#0288D1"),
     TOILETS(MainCategory.WATER_HYGIENE, "Тоалетни", "Toilets", "🚻", "amenity", "toilets", "#7B1FA2"),
     SPRINGS(MainCategory.WATER_HYGIENE, "Извори", "Springs", "🏞️", "natural", "spring", "#00ACC1"),
 
-    // Отдих & Спорт
     BENCHES(MainCategory.LEISURE, "Пейки", "Benches", "🪑", "amenity", "bench", "#8D6E63"),
     PLAYGROUNDS(MainCategory.LEISURE, "Площадки", "Playgrounds", "🛝", "leisure", "playground", "#E91E63"),
     FITNESS(MainCategory.LEISURE, "Външен фитнес", "Outdoor Gym", "🏋️", "leisure", "fitness_station", "#4CAF50"),
@@ -118,16 +132,13 @@ enum class PoiCategory(
     PICNIC(MainCategory.LEISURE, "Пикник", "Picnic Areas", "🧺", "leisure", "picnic_site", "#FF9800"),
     VIEWPOINTS(MainCategory.LEISURE, "Гледки", "Viewpoints", "🌅", "tourism", "viewpoint", "#9C27B0"),
 
-    // Транспорт
     EV_CHARGING(MainCategory.TRANSPORT, "EV Зарядни", "EV Chargers", "⚡", "amenity", "charging_station", "#FBC02D"),
     BIKE_PARKING(MainCategory.TRANSPORT, "Велостойки", "Bike Parking", "🚲", "amenity", "bicycle_parking", "#009688"),
     BIKE_RENTAL(MainCategory.TRANSPORT, "Колела под наем", "Bike Rental", "🚴", "amenity", "bicycle_rental", "#00BCD4"),
     BIKE_REPAIR(MainCategory.TRANSPORT, "Велоремонт", "Bike Repair", "🔧", "amenity", "bike_repair_station", "#607D8B"),
 
-    // Еко & Рециклиране
     RECYCLING(MainCategory.ECO, "Рециклиране", "Recycling", "♻️", "amenity", "recycling", "#00796B"),
 
-    // Култура & Град
     ART(MainCategory.CULTURE, "Стрийт Арт", "Street Art", "🎨", "tourism", "artwork", "#F57C00"),
     BOOKCASE(MainCategory.CULTURE, "Книги", "Bookcases", "📚", "amenity", "public_bookcase", "#8D6E63"),
     PARCEL_LOCKER(MainCategory.CULTURE, "Шкафчета", "Parcel Lockers", "📦", "amenity", "parcel_locker", "#FF5722"),
@@ -152,11 +163,11 @@ interface OverpassApi {
     companion object {
         fun create(): OverpassApi {
             val okHttpClient = OkHttpClient.Builder()
-                .connectTimeout(35, TimeUnit.SECONDS)
-                .readTimeout(35, TimeUnit.SECONDS)
+                .connectTimeout(40, TimeUnit.SECONDS)
+                .readTimeout(40, TimeUnit.SECONDS)
                 .addInterceptor { chain ->
                     val request = chain.request().newBuilder()
-                        .header("User-Agent", "OasisUrban-MobileApp/3.0 (Android)")
+                        .header("User-Agent", "OasisUrban-MobileApp/3.1 (Android)")
                         .build()
                     chain.proceed(request)
                 }
@@ -233,14 +244,36 @@ private fun formatSpotDetails(category: PoiCategory, tags: Map<String, String>?,
         }
         details.add(if (lang == AppLanguage.BG) "Достъп за колички: $wcText" else "Wheelchair access: $wcText")
     }
-    tags["description"]?.let {
-        details.add(if (lang == AppLanguage.BG) "Описание: $it" else "Description: $it")
+
+    val desc = when (lang) {
+        AppLanguage.BG -> tags["description:bg"] ?: tags["description"]
+        AppLanguage.EN -> tags["description:en"] ?: tags["description"]
     }
+    desc?.let { details.add(if (lang == AppLanguage.BG) "Описание: $it" else "Description: $it") }
 
     return if (details.isEmpty()) {
         if (lang == AppLanguage.BG) "Обект от OSM категория '${category.labelBg}'"
         else "Object from OSM category '${category.labelEn}'"
     } else details.joinToString("\n")
+}
+
+// Построяване на единна Overpass заявка за всички категории наведнъж
+private fun buildUnifiedOverpassQuery(lat: Double, lon: Double, radiusMeters: Int): String {
+    val subQueries = PoiCategory.entries.joinToString("\n") { cat ->
+        """
+        node["${cat.osmKey}"="${cat.osmValue}"](around:$radiusMeters,$lat,$lon);
+        way["${cat.osmKey}"="${cat.osmValue}"](around:$radiusMeters,$lat,$lon);
+        relation["${cat.osmKey}"="${cat.osmValue}"](around:$radiusMeters,$lat,$lon);
+        """.trimIndent()
+    }
+
+    return """
+        [out:json][timeout:40];
+        (
+          $subQueries
+        );
+        out center;
+    """.trimIndent()
 }
 
 // --- 3. Главен Activity ---
@@ -267,13 +300,12 @@ fun MainScreen() {
     val coroutineScope = rememberCoroutineScope()
     val api = remember { OverpassApi.create() }
 
-    val cacheList = remember { mutableStateListOf<CachedQueryResult>() }
+    val cacheList = remember { mutableStateListOf<CachedAreaResult>() }
 
     var currentLanguage by remember { mutableStateOf(AppLanguage.BG) }
-
-    // Начални състояния: "Вода & Хигиена" -> "Чешми"
     var selectedMainCategory by remember { mutableStateOf(MainCategory.WATER_HYGIENE) }
     var selectedPoiCategory by remember { mutableStateOf(PoiCategory.FOUNTAINS) }
+    var radiusKm by remember { mutableStateOf(3.0f) }
 
     var isLoading by remember { mutableStateOf(false) }
     var activeJob by remember { mutableStateOf<Job?>(null) }
@@ -324,15 +356,18 @@ fun MainScreen() {
         }
     }
 
-    fun renderElements(elements: List<Element>, category: PoiCategory, lang: AppLanguage) {
+    // Изрисоване на филтрираните маркери от дадена категория
+    fun renderCategoryElements(allElements: List<Element>, category: PoiCategory, lang: AppLanguage) {
+        val filtered = allElements.filter { it.belongsToCategory(category) }
         val poiIcon = createEmojiMarkerIcon(context, category.icon, category.colorHex)
-        elements.forEach { element ->
+
+        filtered.forEach { element ->
             val lat = element.actualLat
             val lon = element.actualLon
             if (lat != null && lon != null) {
                 val marker = Marker(mapView).apply {
                     position = GeoPoint(lat, lon)
-                    title = element.tags?.get("name") ?: "${category.icon} ${category.label(lang)}"
+                    title = element.getLocalizedTitle(category, lang)
                     snippet = formatSpotDetails(category, element.tags, lang)
                     icon = poiIcon
                     setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
@@ -341,27 +376,39 @@ fun MainScreen() {
             }
         }
         mapView.invalidate()
+
+        if (filtered.isEmpty()) {
+            val msg = if (lang == AppLanguage.BG) {
+                "Няма намерени '${category.labelBg}' в този радиус"
+            } else {
+                "No '${category.labelEn}' found in this radius"
+            }
+            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+        }
     }
 
-    fun loadData(category: PoiCategory, center: GeoPoint, lang: AppLanguage) {
+    // Зареждане или филтриране от кеша
+    fun loadOrFilterData(category: PoiCategory, center: GeoPoint, radius: Float, lang: AppLanguage) {
         activeJob?.cancel()
 
         mapView.overlays.clear()
         mapView.overlays.add(mapEventsOverlay)
         mapView.overlays.add(myLocationOverlay)
 
+        // Изрисоване на центъра
+        val radiusMeters = (radius * 1000).toInt()
         val centerMarker = Marker(mapView).apply {
             position = center
             title = if (lang == AppLanguage.BG) "Избрана локация" else "Selected location"
-            snippet = if (lang == AppLanguage.BG) "Център на търсене (радиус 3 км)" else "Search center (3 km radius)"
+            snippet = if (lang == AppLanguage.BG) "Център (радиус ${String.format("%.1f", radius)} км)" else "Center (radius ${String.format("%.1f", radius)} km)"
             icon = createEmojiMarkerIcon(context, "📍", "#D32F2F")
             setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
         }
         mapView.overlays.add(centerMarker)
-        centerMarker.showInfoWindow()
 
+        // Изрисоване на кръга за радиус
         val circle = Polygon().apply {
-            points = Polygon.pointsAsCircle(center, 3000.0)
+            points = Polygon.pointsAsCircle(center, radiusMeters.toDouble())
             fillPaint.color = Color.argb(35, 33, 150, 243)
             outlinePaint.color = Color.argb(120, 33, 150, 243)
             outlinePaint.strokeWidth = 3f
@@ -369,31 +416,21 @@ fun MainScreen() {
         mapView.overlays.add(circle)
         mapView.invalidate()
 
-        // Проверка в кеша
+        // ПРОВЕРКА В КЕША ЗА ЦЕЛИЯ РАЙОН
         val cachedHit = cacheList.firstOrNull { cached ->
-            cached.category == category && center.distanceToAsDouble(cached.center) < 1000.0
+            center.distanceToAsDouble(cached.center) < 500.0 && abs(cached.radiusKm - radius) < 0.2f
         }
 
         if (cachedHit != null) {
-            renderElements(cachedHit.elements, category, lang)
-            val msg = if (lang == AppLanguage.BG) "⚡ Заредено от кеша" else "⚡ Loaded from cache"
-            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            renderCategoryElements(cachedHit.elements, category, lang)
             return
         }
 
-        // Заявка към Overpass API
+        // Заявка за ВСИЧКИ категории в района наведнъж
         activeJob = coroutineScope.launch {
             isLoading = true
             try {
-                val query = """
-                    [out:json][timeout:35];
-                    (
-                      node["${category.osmKey}"="${category.osmValue}"](around:3000,${center.latitude},${center.longitude});
-                      way["${category.osmKey}"="${category.osmValue}"](around:3000,${center.latitude},${center.longitude});
-                      relation["${category.osmKey}"="${category.osmValue}"](around:3000,${center.latitude},${center.longitude});
-                    );
-                    out center;
-                """.trimIndent()
+                val query = buildUnifiedOverpassQuery(center.latitude, center.longitude, radiusMeters)
 
                 var bestResponse: OverpassResponse? = null
                 var lastException: Exception? = null
@@ -418,19 +455,12 @@ fun MainScreen() {
                     if (lang == AppLanguage.BG) "Няма връзка със сървърите." else "No server connection."
                 ))
 
-                if (finalResponse.elements.isEmpty()) {
-                    val msg = if (lang == AppLanguage.BG) {
-                        "Няма намерени '${category.labelBg}' наоколо"
-                    } else {
-                        "No '${category.labelEn}' found nearby"
-                    }
-                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                } else {
-                    cacheList.add(CachedQueryResult(category, center, finalResponse.elements))
-                    renderElements(finalResponse.elements, category, lang)
-                }
+                // Записваме целия район в кеша
+                cacheList.add(CachedAreaResult(center, radius, finalResponse.elements))
+                renderCategoryElements(finalResponse.elements, category, lang)
+
             } catch (e: CancellationException) {
-                // Прекъснато при нова заявка
+                // Прекъснато
             } catch (e: Exception) {
                 Log.e("OasisUrban", "Грешка при зареждане", e)
                 val errPrefix = if (lang == AppLanguage.BG) "Мрежова грешка: " else "Network error: "
@@ -463,8 +493,9 @@ fun MainScreen() {
         )
     }
 
-    LaunchedEffect(selectedPoiCategory, searchCenterGeoPoint, currentLanguage) {
-        loadData(selectedPoiCategory, searchCenterGeoPoint, currentLanguage)
+    // Задействане при промяна на параметри
+    LaunchedEffect(selectedPoiCategory, searchCenterGeoPoint, radiusKm, currentLanguage) {
+        loadOrFilterData(selectedPoiCategory, searchCenterGeoPoint, radiusKm, currentLanguage)
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -473,7 +504,7 @@ fun MainScreen() {
             modifier = Modifier.fillMaxSize()
         )
 
-        // Двуредово меню отгоре
+        // ГОРНО ДВУРЕДОВО МЕНЮ ЗА КАТЕГОРИИ
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -490,7 +521,7 @@ fun MainScreen() {
             ) {
                 Column(modifier = Modifier.padding(vertical = 6.dp)) {
 
-                    // РЕД 1: Основни Категории
+                    // РЕД 1: Главни Групи
                     LazyRow(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -500,7 +531,6 @@ fun MainScreen() {
                                 selected = selectedMainCategory == mainCat,
                                 onClick = {
                                     selectedMainCategory = mainCat
-                                    // При смяна на основна категория автоматично избираме първия обект от нея
                                     val firstSub = PoiCategory.entries.firstOrNull { it.mainCategory == mainCat }
                                     if (firstSub != null) {
                                         selectedPoiCategory = firstSub
@@ -516,7 +546,7 @@ fun MainScreen() {
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
                     )
 
-                    // РЕД 2: Обекти от избраната категория
+                    // РЕД 2: Обекти от избраната група
                     LazyRow(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -541,54 +571,86 @@ fun MainScreen() {
             }
         }
 
-        // 1. Компактен бутон за език (Долу вляво)
-        SmallFloatingActionButton(
-            onClick = {
-                currentLanguage = if (currentLanguage == AppLanguage.BG) AppLanguage.EN else AppLanguage.BG
-            },
+        // ДОЛНА КОНТРОЛНА ЛЕНТА (ЕЗИК, СЛАЙДЕР ЗА РАДИУС И GPS)
+        Surface(
             modifier = Modifier
-                .align(Alignment.BottomStart)
+                .align(Alignment.BottomCenter)
                 .navigationBarsPadding()
-                .padding(bottom = 20.dp, start = 16.dp),
-            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
-            contentColor = MaterialTheme.colorScheme.primary,
-            shape = RoundedCornerShape(12.dp)
+                .padding(bottom = 16.dp, start = 12.dp, end = 12.dp)
+                .fillMaxWidth(),
+            shape = RoundedCornerShape(20.dp),
+            shadowElevation = 8.dp,
+            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
         ) {
-            Text(
-                text = if (currentLanguage == AppLanguage.BG) "🇧🇬 BG" else "🇬🇧 EN",
-                fontWeight = FontWeight.Bold,
-                fontSize = 12.sp,
-                modifier = Modifier.padding(horizontal = 4.dp)
-            )
-        }
-
-        // 2. Компактен бутон за текуща GPS локация (Долу вдясно)
-        SmallFloatingActionButton(
-            onClick = {
-                val myLoc = myLocationOverlay.myLocation
-                val geoPoint = if (myLoc != null) {
-                    GeoPoint(myLoc.latitude, myLoc.longitude)
-                } else {
-                    getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
+            Row(
+                modifier = Modifier
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                    .fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                // 1. Бутон за Език
+                TextButton(
+                    onClick = {
+                        currentLanguage = if (currentLanguage == AppLanguage.BG) AppLanguage.EN else AppLanguage.BG
+                    },
+                    contentPadding = PaddingValues(horizontal = 8.dp)
+                ) {
+                    Text(
+                        text = if (currentLanguage == AppLanguage.BG) "🇧🇬 BG" else "🇬🇧 EN",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
                 }
 
-                if (geoPoint != null) {
-                    searchCenterGeoPoint = geoPoint
-                    mapView.controller.animateTo(geoPoint)
-                } else {
-                    val msg = if (currentLanguage == AppLanguage.BG) "Търсене на GPS сигнал..." else "Searching for GPS signal..."
-                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                // 2. Слайдер за Радиус (1.0 - 6.0 км)
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = if (currentLanguage == AppLanguage.BG) {
+                            "Радиус: ${String.format("%.1f", radiusKm)} км"
+                        } else {
+                            "Radius: ${String.format("%.1f", radiusKm)} km"
+                        },
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Slider(
+                        value = radiusKm,
+                        onValueChange = { radiusKm = it },
+                        valueRange = 1.0f..6.0f,
+                        steps = 9, // стъпка през 0.5 км (1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0)
+                        modifier = Modifier.height(22.dp)
+                    )
                 }
-            },
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .navigationBarsPadding()
-                .padding(bottom = 20.dp, end = 16.dp),
-            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
-            contentColor = MaterialTheme.colorScheme.primary,
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Text("🎯", fontSize = 18.sp)
+
+                // 3. Бутон за GPS Локация
+                IconButton(
+                    onClick = {
+                        val myLoc = myLocationOverlay.myLocation
+                        val geoPoint = if (myLoc != null) {
+                            GeoPoint(myLoc.latitude, myLoc.longitude)
+                        } else {
+                            getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
+                        }
+
+                        if (geoPoint != null) {
+                            searchCenterGeoPoint = geoPoint
+                            mapView.controller.animateTo(geoPoint)
+                        } else {
+                            val msg = if (currentLanguage == AppLanguage.BG) "Търсене на GPS сигнал..." else "Searching for GPS signal..."
+                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                ) {
+                    Text("🎯", fontSize = 18.sp)
+                }
+            }
         }
     }
 }
