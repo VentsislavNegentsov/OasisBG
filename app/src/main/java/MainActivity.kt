@@ -48,7 +48,6 @@ import org.osmdroid.views.overlay.Polygon
 import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 import retrofit2.Retrofit
-import com.oasisbg.ui.theme.OasisUrbanTheme
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Field
 import retrofit2.http.FormUrlEncoded
@@ -56,14 +55,11 @@ import retrofit2.http.POST
 import retrofit2.http.Url
 import java.util.concurrent.TimeUnit
 
-// --- 1. Модели за данни, Кеш, Локализация & Retrofit API ---
+// --- 1. Модели за данни, Категории (2 Нива), Локализация & API ---
 
 enum class AppLanguage { BG, EN }
 
-data class Center(
-    val lat: Double,
-    val lon: Double
-)
+data class Center(val lat: Double, val lon: Double)
 
 data class Element(
     val id: Long,
@@ -78,14 +74,30 @@ data class Element(
 
 data class OverpassResponse(val elements: List<Element>)
 
-// Кеш запис за запазване на вече изгледани локации
 data class CachedQueryResult(
-    val category: MapCategory,
+    val category: PoiCategory,
     val center: GeoPoint,
     val elements: List<Element>
 )
 
-enum class MapCategory(
+// Ниво 1: Главни Групи Категории
+enum class MainCategory(
+    val labelBg: String,
+    val labelEn: String,
+    val icon: String
+) {
+    WATER_HYGIENE("Вода & Хигиена", "Water & Hygiene", "💧"),
+    LEISURE("Отдих & Спорт", "Leisure & Sport", "🌳"),
+    TRANSPORT("Транспорт", "Transport", "🚲"),
+    ECO("Еко & Рециклиране", "Eco & Recycling", "♻️"),
+    CULTURE("Култура & Град", "Culture & City", "🎨");
+
+    fun label(lang: AppLanguage): String = if (lang == AppLanguage.BG) labelBg else labelEn
+}
+
+// Ниво 2: Конкретни Обекти (POI)
+enum class PoiCategory(
+    val mainCategory: MainCategory,
     val labelBg: String,
     val labelEn: String,
     val icon: String,
@@ -93,11 +105,33 @@ enum class MapCategory(
     val osmValue: String,
     val colorHex: String
 ) {
-    FOUNTAINS("Чешми", "Fountains", "🚰", "amenity", "drinking_water", "#0288D1"),
-    TOILETS("Тоалетни", "Toilets", "🚻", "amenity", "toilets", "#7B1FA2"),
-    ART("Стрийт Арт", "Street Art", "🎨", "tourism", "artwork", "#F57C00"),
-    DOG_PARKS("Кучета", "Dog Parks", "🐕", "leisure", "dog_park", "#388E3C"),
-    RECYCLING("Рециклиране", "Recycling", "♻️", "amenity", "recycling", "#00796B");
+    // Вода & Хигиена
+    FOUNTAINS(MainCategory.WATER_HYGIENE, "Чешми", "Fountains", "🚰", "amenity", "drinking_water", "#0288D1"),
+    TOILETS(MainCategory.WATER_HYGIENE, "Тоалетни", "Toilets", "🚻", "amenity", "toilets", "#7B1FA2"),
+    SPRINGS(MainCategory.WATER_HYGIENE, "Извори", "Springs", "🏞️", "natural", "spring", "#00ACC1"),
+
+    // Отдих & Спорт
+    BENCHES(MainCategory.LEISURE, "Пейки", "Benches", "🪑", "amenity", "bench", "#8D6E63"),
+    PLAYGROUNDS(MainCategory.LEISURE, "Площадки", "Playgrounds", "🛝", "leisure", "playground", "#E91E63"),
+    FITNESS(MainCategory.LEISURE, "Външен фитнес", "Outdoor Gym", "🏋️", "leisure", "fitness_station", "#4CAF50"),
+    DOG_PARKS(MainCategory.LEISURE, "Кучета", "Dog Parks", "🐕", "leisure", "dog_park", "#388E3C"),
+    PICNIC(MainCategory.LEISURE, "Пикник", "Picnic Areas", "🧺", "leisure", "picnic_site", "#FF9800"),
+    VIEWPOINTS(MainCategory.LEISURE, "Гледки", "Viewpoints", "🌅", "tourism", "viewpoint", "#9C27B0"),
+
+    // Транспорт
+    EV_CHARGING(MainCategory.TRANSPORT, "EV Зарядни", "EV Chargers", "⚡", "amenity", "charging_station", "#FBC02D"),
+    BIKE_PARKING(MainCategory.TRANSPORT, "Велостойки", "Bike Parking", "🚲", "amenity", "bicycle_parking", "#009688"),
+    BIKE_RENTAL(MainCategory.TRANSPORT, "Колела под наем", "Bike Rental", "🚴", "amenity", "bicycle_rental", "#00BCD4"),
+    BIKE_REPAIR(MainCategory.TRANSPORT, "Велоремонт", "Bike Repair", "🔧", "amenity", "bike_repair_station", "#607D8B"),
+
+    // Еко & Рециклиране
+    RECYCLING(MainCategory.ECO, "Рециклиране", "Recycling", "♻️", "amenity", "recycling", "#00796B"),
+
+    // Култура & Град
+    ART(MainCategory.CULTURE, "Стрийт Арт", "Street Art", "🎨", "tourism", "artwork", "#F57C00"),
+    BOOKCASE(MainCategory.CULTURE, "Книги", "Bookcases", "📚", "amenity", "public_bookcase", "#8D6E63"),
+    PARCEL_LOCKER(MainCategory.CULTURE, "Шкафчета", "Parcel Lockers", "📦", "amenity", "parcel_locker", "#FF5722"),
+    MONUMENTS(MainCategory.CULTURE, "Паметници", "Monuments", "🗿", "historic", "monument", "#78909C");
 
     fun label(lang: AppLanguage): String = if (lang == AppLanguage.BG) labelBg else labelEn
 }
@@ -107,8 +141,7 @@ val OVERPASS_SERVERS = listOf(
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
     "https://overpass.osm.ch/api/interpreter",
-    "https://overpass.nchc.org.tw/api/interpreter",
-    "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+    "https://overpass.nchc.org.tw/api/interpreter"
 )
 
 interface OverpassApi {
@@ -119,11 +152,11 @@ interface OverpassApi {
     companion object {
         fun create(): OverpassApi {
             val okHttpClient = OkHttpClient.Builder()
-                .connectTimeout(40, TimeUnit.SECONDS)
-                .readTimeout(40, TimeUnit.SECONDS)
+                .connectTimeout(35, TimeUnit.SECONDS)
+                .readTimeout(35, TimeUnit.SECONDS)
                 .addInterceptor { chain ->
                     val request = chain.request().newBuilder()
-                        .header("User-Agent", "OasisUrban-MobileApp/2.4 (Android)")
+                        .header("User-Agent", "OasisUrban-MobileApp/3.0 (Android)")
                         .build()
                     chain.proceed(request)
                 }
@@ -139,7 +172,7 @@ interface OverpassApi {
     }
 }
 
-// --- 2. Помощни функции за иконки и форматиране ---
+// --- 2. Помощни функции ---
 
 private fun createEmojiMarkerIcon(context: Context, emoji: String, backgroundColorHex: String): Drawable {
     val density = context.resources.displayMetrics.density
@@ -171,7 +204,7 @@ private fun createEmojiMarkerIcon(context: Context, emoji: String, backgroundCol
     return BitmapDrawable(context.resources, bitmap)
 }
 
-private fun formatSpotDetails(category: MapCategory, tags: Map<String, String>?, lang: AppLanguage): String {
+private fun formatSpotDetails(category: PoiCategory, tags: Map<String, String>?, lang: AppLanguage): String {
     if (tags.isNullOrEmpty()) {
         return if (lang == AppLanguage.BG) "Няма допълнителни данни" else "No additional details"
     }
@@ -203,9 +236,6 @@ private fun formatSpotDetails(category: MapCategory, tags: Map<String, String>?,
     tags["description"]?.let {
         details.add(if (lang == AppLanguage.BG) "Описание: $it" else "Description: $it")
     }
-    tags["note"]?.let {
-        details.add(if (lang == AppLanguage.BG) "Бележка: $it" else "Note: $it")
-    }
 
     return if (details.isEmpty()) {
         if (lang == AppLanguage.BG) "Обект от OSM категория '${category.labelBg}'"
@@ -222,7 +252,7 @@ class MainActivity : ComponentActivity() {
         Configuration.getInstance().userAgentValue = packageName
 
         setContent {
-            OasisUrbanTheme {
+            MaterialTheme {
                 MainScreen()
             }
         }
@@ -237,15 +267,22 @@ fun MainScreen() {
     val coroutineScope = rememberCoroutineScope()
     val api = remember { OverpassApi.create() }
 
-    // Кеш списък за търсенията в текущата сесия
     val cacheList = remember { mutableStateListOf<CachedQueryResult>() }
 
     var currentLanguage by remember { mutableStateOf(AppLanguage.BG) }
-    var selectedCategory by remember { mutableStateOf(MapCategory.FOUNTAINS) }
+
+    // Начални състояния: "Вода & Хигиена" -> "Чешми"
+    var selectedMainCategory by remember { mutableStateOf(MainCategory.WATER_HYGIENE) }
+    var selectedPoiCategory by remember { mutableStateOf(PoiCategory.FOUNTAINS) }
+
     var isLoading by remember { mutableStateOf(false) }
     var activeJob by remember { mutableStateOf<Job?>(null) }
 
     var searchCenterGeoPoint by remember { mutableStateOf(GeoPoint(42.6977, 23.3219)) }
+
+    val currentSubCategories = remember(selectedMainCategory) {
+        PoiCategory.entries.filter { it.mainCategory == selectedMainCategory }
+    }
 
     val mapEventsOverlay = remember {
         MapEventsOverlay(object : MapEventsReceiver {
@@ -287,7 +324,7 @@ fun MainScreen() {
         }
     }
 
-    fun renderElements(elements: List<Element>, category: MapCategory, lang: AppLanguage) {
+    fun renderElements(elements: List<Element>, category: PoiCategory, lang: AppLanguage) {
         val poiIcon = createEmojiMarkerIcon(context, category.icon, category.colorHex)
         elements.forEach { element ->
             val lat = element.actualLat
@@ -306,7 +343,7 @@ fun MainScreen() {
         mapView.invalidate()
     }
 
-    fun loadData(category: MapCategory, center: GeoPoint, lang: AppLanguage) {
+    fun loadData(category: PoiCategory, center: GeoPoint, lang: AppLanguage) {
         activeJob?.cancel()
 
         mapView.overlays.clear()
@@ -332,25 +369,24 @@ fun MainScreen() {
         mapView.overlays.add(circle)
         mapView.invalidate()
 
-        // --- КЕШ ПРОВЕРКА ---
-        // Ако има търсене в същата категория на разстояние по-малко от 1000м (1км), зареждаме от кеша!
+        // Проверка в кеша
         val cachedHit = cacheList.firstOrNull { cached ->
             cached.category == category && center.distanceToAsDouble(cached.center) < 1000.0
         }
 
         if (cachedHit != null) {
             renderElements(cachedHit.elements, category, lang)
-            val msg = if (lang == AppLanguage.BG) "⚡ Заредено моментално от кеша" else "⚡ Loaded instantly from cache"
+            val msg = if (lang == AppLanguage.BG) "⚡ Заредено от кеша" else "⚡ Loaded from cache"
             Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
             return
         }
 
-        // Ако няма кеш, правим заявка към Overpass API
+        // Заявка към Overpass API
         activeJob = coroutineScope.launch {
             isLoading = true
             try {
                 val query = """
-                    [out:json][timeout:40];
+                    [out:json][timeout:35];
                     (
                       node["${category.osmKey}"="${category.osmValue}"](around:3000,${center.latitude},${center.longitude});
                       way["${category.osmKey}"="${category.osmValue}"](around:3000,${center.latitude},${center.longitude});
@@ -384,18 +420,17 @@ fun MainScreen() {
 
                 if (finalResponse.elements.isEmpty()) {
                     val msg = if (lang == AppLanguage.BG) {
-                        "Няма намерени обекти от тип '${category.labelBg}'"
+                        "Няма намерени '${category.labelBg}' наоколо"
                     } else {
-                        "No objects found for '${category.labelEn}'"
+                        "No '${category.labelEn}' found nearby"
                     }
                     Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                 } else {
-                    // Записваме резултата в кеша за бъдещи кликове
                     cacheList.add(CachedQueryResult(category, center, finalResponse.elements))
                     renderElements(finalResponse.elements, category, lang)
                 }
             } catch (e: CancellationException) {
-                // Игнорира се при ново преместване
+                // Прекъснато при нова заявка
             } catch (e: Exception) {
                 Log.e("OasisUrban", "Грешка при зареждане", e)
                 val errPrefix = if (lang == AppLanguage.BG) "Мрежова грешка: " else "Network error: "
@@ -428,8 +463,8 @@ fun MainScreen() {
         )
     }
 
-    LaunchedEffect(selectedCategory, searchCenterGeoPoint, currentLanguage) {
-        loadData(selectedCategory, searchCenterGeoPoint, currentLanguage)
+    LaunchedEffect(selectedPoiCategory, searchCenterGeoPoint, currentLanguage) {
+        loadData(selectedPoiCategory, searchCenterGeoPoint, currentLanguage)
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -438,7 +473,7 @@ fun MainScreen() {
             modifier = Modifier.fillMaxSize()
         )
 
-        // Горно меню с филтри
+        // Двуредово меню отгоре
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -449,22 +484,50 @@ fun MainScreen() {
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 12.dp),
-                shape = RoundedCornerShape(24.dp),
+                shape = RoundedCornerShape(20.dp),
                 shadowElevation = 8.dp,
                 color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
             ) {
-                LazyRow(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    items(MapCategory.entries) { category ->
-                        FilterChip(
-                            selected = selectedCategory == category,
-                            onClick = { selectedCategory = category },
-                            label = { Text("${category.icon} ${category.label(currentLanguage)}") }
-                        )
+                Column(modifier = Modifier.padding(vertical = 6.dp)) {
+
+                    // РЕД 1: Основни Категории
+                    LazyRow(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(MainCategory.entries) { mainCat ->
+                            FilterChip(
+                                selected = selectedMainCategory == mainCat,
+                                onClick = {
+                                    selectedMainCategory = mainCat
+                                    // При смяна на основна категория автоматично избираме първия обект от нея
+                                    val firstSub = PoiCategory.entries.firstOrNull { it.mainCategory == mainCat }
+                                    if (firstSub != null) {
+                                        selectedPoiCategory = firstSub
+                                    }
+                                },
+                                label = { Text("${mainCat.icon} ${mainCat.label(currentLanguage)}", fontSize = 13.sp) }
+                            )
+                        }
+                    }
+
+                    HorizontalDivider(
+                        modifier = Modifier.padding(vertical = 4.dp, horizontal = 12.dp),
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                    )
+
+                    // РЕД 2: Обекти от избраната категория
+                    LazyRow(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(currentSubCategories) { poi ->
+                            FilterChip(
+                                selected = selectedPoiCategory == poi,
+                                onClick = { selectedPoiCategory = poi },
+                                label = { Text("${poi.icon} ${poi.label(currentLanguage)}", fontSize = 12.sp) }
+                            )
+                        }
                     }
                 }
             }
@@ -473,7 +536,7 @@ fun MainScreen() {
                 LinearProgressIndicator(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 24.dp, vertical = 8.dp)
+                        .padding(horizontal = 24.dp, vertical = 6.dp)
                 )
             }
         }
