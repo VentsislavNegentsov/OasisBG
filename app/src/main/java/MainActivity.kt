@@ -2,6 +2,7 @@ package com.oasisbg
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -17,6 +18,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
@@ -24,9 +26,12 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -50,7 +55,9 @@ import retrofit2.http.POST
 import retrofit2.http.Url
 import java.util.concurrent.TimeUnit
 
-// --- 1. Модели за данни & Retrofit API ---
+// --- 1. Модели за данни, Локализация & Retrofit API ---
+
+enum class AppLanguage { BG, EN }
 
 data class Center(
     val lat: Double,
@@ -71,17 +78,20 @@ data class Element(
 data class OverpassResponse(val elements: List<Element>)
 
 enum class MapCategory(
-    val label: String,
+    val labelBg: String,
+    val labelEn: String,
     val icon: String,
     val osmKey: String,
     val osmValue: String,
     val colorHex: String
 ) {
-    FOUNTAINS("Чешми", "🚰", "amenity", "drinking_water", "#0288D1"),
-    TOILETS("Тоалетни", "🚻", "amenity", "toilets", "#7B1FA2"),
-    ART("Стрийт Арт", "🎨", "tourism", "artwork", "#F57C00"),
-    DOG_PARKS("Кучета", "🐕", "leisure", "dog_park", "#388E3C"),
-    RECYCLING("Рециклиране", "♻️", "amenity", "recycling", "#00796B")
+    FOUNTAINS("Чешми", "Fountains", "🚰", "amenity", "drinking_water", "#0288D1"),
+    TOILETS("Тоалетни", "Toilets", "🚻", "amenity", "toilets", "#7B1FA2"),
+    ART("Стрийт Арт", "Street Art", "🎨", "tourism", "artwork", "#F57C00"),
+    DOG_PARKS("Кучета", "Dog Parks", "🐕", "leisure", "dog_park", "#388E3C"),
+    RECYCLING("Рециклиране", "Recycling", "♻️", "amenity", "recycling", "#00796B");
+
+    fun label(lang: AppLanguage): String = if (lang == AppLanguage.BG) labelBg else labelEn
 }
 
 val OVERPASS_SERVERS = listOf(
@@ -105,7 +115,7 @@ interface OverpassApi {
                 .readTimeout(40, TimeUnit.SECONDS)
                 .addInterceptor { chain ->
                     val request = chain.request().newBuilder()
-                        .header("User-Agent", "OasisBG-MobileApp/1.8 (Android)")
+                        .header("User-Agent", "OasisBG-MobileApp/2.3 (Android)")
                         .build()
                     chain.proceed(request)
                 }
@@ -121,7 +131,7 @@ interface OverpassApi {
     }
 }
 
-// --- 2. Генератор на иконки с емоджита ---
+// --- 2. Помощни функции за иконки и форматиране ---
 
 private fun createEmojiMarkerIcon(context: Context, emoji: String, backgroundColorHex: String): Drawable {
     val density = context.resources.displayMetrics.density
@@ -153,25 +163,46 @@ private fun createEmojiMarkerIcon(context: Context, emoji: String, backgroundCol
     return BitmapDrawable(context.resources, bitmap)
 }
 
-private fun formatSpotDetails(category: MapCategory, tags: Map<String, String>?): String {
-    if (tags.isNullOrEmpty()) return "Няма допълнителни данни"
+private fun formatSpotDetails(category: MapCategory, tags: Map<String, String>?, lang: AppLanguage): String {
+    if (tags.isNullOrEmpty()) {
+        return if (lang == AppLanguage.BG) "Няма допълнителни данни" else "No additional details"
+    }
 
     val details = mutableListOf<String>()
 
-    tags["operator"]?.let { details.add("Стопанин: $it") }
-    tags["opening_hours"]?.let { details.add("Работно време: $it") }
+    tags["operator"]?.let {
+        details.add(if (lang == AppLanguage.BG) "Стопанин: $it" else "Operator: $it")
+    }
+    tags["opening_hours"]?.let {
+        details.add(if (lang == AppLanguage.BG) "Работно време: $it" else "Opening hours: $it")
+    }
     tags["fee"]?.let {
-        val feeText = if (it == "no") "Безплатно" else "Платено ($it)"
-        details.add("Такса: $feeText")
+        val feeText = if (it == "no") {
+            if (lang == AppLanguage.BG) "Безплатно" else "Free"
+        } else {
+            if (lang == AppLanguage.BG) "Платено ($it)" else "Fee ($it)"
+        }
+        details.add(if (lang == AppLanguage.BG) "Такса: $feeText" else "Fee: $feeText")
     }
     tags["wheelchair"]?.let {
-        val wcText = if (it == "yes") "Да" else "Не"
-        details.add("Достъп за колички: $wcText")
+        val wcText = if (it == "yes") {
+            if (lang == AppLanguage.BG) "Да" else "Yes"
+        } else {
+            if (lang == AppLanguage.BG) "Не" else "No"
+        }
+        details.add(if (lang == AppLanguage.BG) "Достъп за колички: $wcText" else "Wheelchair access: $wcText")
     }
-    tags["description"]?.let { details.add("Описание: $it") }
-    tags["note"]?.let { details.add("Бележка: $it") }
+    tags["description"]?.let {
+        details.add(if (lang == AppLanguage.BG) "Описание: $it" else "Description: $it")
+    }
+    tags["note"]?.let {
+        details.add(if (lang == AppLanguage.BG) "Бележка: $it" else "Note: $it")
+    }
 
-    return if (details.isEmpty()) "Обект от OSM категория '${category.label}'" else details.joinToString("\n")
+    return if (details.isEmpty()) {
+        if (lang == AppLanguage.BG) "Обект от OSM категория '${category.labelBg}'"
+        else "Object from OSM category '${category.labelEn}'"
+    } else details.joinToString("\n")
 }
 
 // --- 3. Главен Activity ---
@@ -179,6 +210,7 @@ private fun formatSpotDetails(category: MapCategory, tags: Map<String, String>?)
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         Configuration.getInstance().userAgentValue = packageName
 
         setContent {
@@ -197,6 +229,7 @@ fun MainScreen() {
     val coroutineScope = rememberCoroutineScope()
     val api = remember { OverpassApi.create() }
 
+    var currentLanguage by remember { mutableStateOf(AppLanguage.BG) }
     var selectedCategory by remember { mutableStateOf(MapCategory.FOUNTAINS) }
     var isLoading by remember { mutableStateOf(false) }
     var activeJob by remember { mutableStateOf<Job?>(null) }
@@ -230,13 +263,48 @@ fun MainScreen() {
         }
     }
 
-    fun loadData(category: MapCategory, center: GeoPoint) {
+    LaunchedEffect(myLocationOverlay) {
+        myLocationOverlay.runOnFirstFix {
+            val loc = myLocationOverlay.myLocation
+            if (loc != null) {
+                val point = GeoPoint(loc.latitude, loc.longitude)
+                (context as? Activity)?.runOnUiThread {
+                    searchCenterGeoPoint = point
+                    mapView.controller.animateTo(point)
+                }
+            }
+        }
+    }
+
+    fun loadData(category: MapCategory, center: GeoPoint, lang: AppLanguage) {
         activeJob?.cancel()
+
+        mapView.overlays.clear()
+        mapView.overlays.add(mapEventsOverlay)
+        mapView.overlays.add(myLocationOverlay)
+
+        val centerMarker = Marker(mapView).apply {
+            position = center
+            title = if (lang == AppLanguage.BG) "Избрана локация" else "Selected location"
+            snippet = if (lang == AppLanguage.BG) "Център на търсене (радиус 3 км)" else "Search center (3 km radius)"
+            icon = createEmojiMarkerIcon(context, "📍", "#D32F2F")
+            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+        }
+        mapView.overlays.add(centerMarker)
+        centerMarker.showInfoWindow()
+
+        val circle = Polygon().apply {
+            points = Polygon.pointsAsCircle(center, 3000.0)
+            fillPaint.color = Color.argb(35, 33, 150, 243)
+            outlinePaint.color = Color.argb(120, 33, 150, 243)
+            outlinePaint.strokeWidth = 3f
+        }
+        mapView.overlays.add(circle)
+        mapView.invalidate()
 
         activeJob = coroutineScope.launch {
             isLoading = true
             try {
-                // Търсене по точки (node), площи (way) и релации (relation)
                 val query = """
                     [out:json][timeout:40];
                     (
@@ -250,7 +318,6 @@ fun MainScreen() {
                 var bestResponse: OverpassResponse? = null
                 var lastException: Exception? = null
 
-                // Опитване на сървърите. Ако даден сървър върне празен отговор, се продължава към следващия.
                 for (serverUrl in OVERPASS_SERVERS) {
                     try {
                         val res = api.getNodes(serverUrl, query)
@@ -267,37 +334,19 @@ fun MainScreen() {
                     }
                 }
 
-                val finalResponse = bestResponse ?: throw (lastException ?: Exception("Няма връзка със сървърите."))
+                val finalResponse = bestResponse ?: throw (lastException ?: Exception(
+                    if (lang == AppLanguage.BG) "Няма връзка със сървърите." else "No server connection."
+                ))
 
-                mapView.overlays.clear()
-                mapView.overlays.add(mapEventsOverlay)
-                mapView.overlays.add(myLocationOverlay)
-
-                // 1. Иконка 📍 за избраната точка
-                val centerMarker = Marker(mapView).apply {
-                    position = center
-                    title = "Избрана локация"
-                    snippet = "Център на търсене (радиус 3 км)"
-                    icon = createEmojiMarkerIcon(context, "📍", "#D32F2F")
-                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                }
-                mapView.overlays.add(centerMarker)
-                centerMarker.showInfoWindow()
-
-                // 2. Синя прозрачна окръжност
-                val circle = Polygon().apply {
-                    points = Polygon.pointsAsCircle(center, 3000.0)
-                    fillPaint.color = Color.argb(35, 33, 150, 243)
-                    outlinePaint.color = Color.argb(120, 33, 150, 243)
-                    outlinePaint.strokeWidth = 3f
-                }
-                mapView.overlays.add(circle)
-
-                // 3. Маркери за обектите
                 val poiIcon = createEmojiMarkerIcon(context, category.icon, category.colorHex)
 
                 if (finalResponse.elements.isEmpty()) {
-                    Toast.makeText(context, "Няма намерени обекти от тип '${category.label}'", Toast.LENGTH_SHORT).show()
+                    val msg = if (lang == AppLanguage.BG) {
+                        "Няма намерени обекти от тип '${category.labelBg}'"
+                    } else {
+                        "No objects found for '${category.labelEn}'"
+                    }
+                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                 } else {
                     finalResponse.elements.forEach { element ->
                         val lat = element.actualLat
@@ -305,8 +354,8 @@ fun MainScreen() {
                         if (lat != null && lon != null) {
                             val marker = Marker(mapView).apply {
                                 position = GeoPoint(lat, lon)
-                                title = element.tags?.get("name") ?: "${category.icon} ${category.label}"
-                                snippet = formatSpotDetails(category, element.tags)
+                                title = element.tags?.get("name") ?: "${category.icon} ${category.label(lang)}"
+                                snippet = formatSpotDetails(category, element.tags, lang)
                                 icon = poiIcon
                                 setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                             }
@@ -316,10 +365,11 @@ fun MainScreen() {
                 }
                 mapView.invalidate()
             } catch (e: CancellationException) {
-                // Игнорира се при започване на ново търсене
+                // Игнорира се при ново преместване
             } catch (e: Exception) {
                 Log.e("OasisBG", "Грешка при зареждане", e)
-                Toast.makeText(context, "Мрежова грешка: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                val errPrefix = if (lang == AppLanguage.BG) "Мрежова грешка: " else "Network error: "
+                Toast.makeText(context, "$errPrefix${e.localizedMessage}", Toast.LENGTH_LONG).show()
             } finally {
                 isLoading = false
             }
@@ -330,12 +380,13 @@ fun MainScreen() {
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         if (permissions.values.contains(true)) {
+            myLocationOverlay.enableMyLocation()
             getUserLocation(context)?.let { userLocation ->
-                searchCenterGeoPoint = GeoPoint(userLocation.latitude, userLocation.longitude)
-                mapView.controller.setCenter(searchCenterGeoPoint)
+                val point = GeoPoint(userLocation.latitude, userLocation.longitude)
+                searchCenterGeoPoint = point
+                mapView.controller.animateTo(point)
             }
         }
-        loadData(selectedCategory, searchCenterGeoPoint)
     }
 
     LaunchedEffect(Unit) {
@@ -347,8 +398,8 @@ fun MainScreen() {
         )
     }
 
-    LaunchedEffect(selectedCategory, searchCenterGeoPoint) {
-        loadData(selectedCategory, searchCenterGeoPoint)
+    LaunchedEffect(selectedCategory, searchCenterGeoPoint, currentLanguage) {
+        loadData(selectedCategory, searchCenterGeoPoint, currentLanguage)
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -357,6 +408,7 @@ fun MainScreen() {
             modifier = Modifier.fillMaxSize()
         )
 
+        // Горно меню с филтри
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -381,7 +433,7 @@ fun MainScreen() {
                         FilterChip(
                             selected = selectedCategory == category,
                             onClick = { selectedCategory = category },
-                            label = { Text("${category.icon} ${category.label}") }
+                            label = { Text("${category.icon} ${category.label(currentLanguage)}") }
                         )
                     }
                 }
@@ -394,6 +446,56 @@ fun MainScreen() {
                         .padding(horizontal = 24.dp, vertical = 8.dp)
                 )
             }
+        }
+
+        // 1. Компактен бутон за език (Долу вляво)
+        SmallFloatingActionButton(
+            onClick = {
+                currentLanguage = if (currentLanguage == AppLanguage.BG) AppLanguage.EN else AppLanguage.BG
+            },
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .navigationBarsPadding()
+                .padding(bottom = 20.dp, start = 16.dp),
+            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+            contentColor = MaterialTheme.colorScheme.primary,
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Text(
+                text = if (currentLanguage == AppLanguage.BG) "🇧🇬 BG" else "🇬🇧 EN",
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(horizontal = 4.dp)
+            )
+        }
+
+        // 2. Компактен бутон за текуща GPS локация (Долу вдясно)
+        SmallFloatingActionButton(
+            onClick = {
+                val myLoc = myLocationOverlay.myLocation
+                val geoPoint = if (myLoc != null) {
+                    GeoPoint(myLoc.latitude, myLoc.longitude)
+                } else {
+                    getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
+                }
+
+                if (geoPoint != null) {
+                    searchCenterGeoPoint = geoPoint
+                    mapView.controller.animateTo(geoPoint)
+                } else {
+                    val msg = if (currentLanguage == AppLanguage.BG) "Търсене на GPS сигнал..." else "Searching for GPS signal..."
+                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                }
+            },
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .navigationBarsPadding()
+                .padding(bottom = 20.dp, end = 16.dp),
+            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f),
+            contentColor = MaterialTheme.colorScheme.primary,
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Text("🎯", fontSize = 18.sp)
         }
     }
 }
