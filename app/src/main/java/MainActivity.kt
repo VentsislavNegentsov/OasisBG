@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
+import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -12,6 +13,10 @@ import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.location.Location
 import android.location.LocationManager
 import android.os.Bundle
@@ -282,8 +287,11 @@ private fun buildUnifiedOverpassQuery(lat: Double, lon: Double, radiusMeters: In
 // --- 3. Главен Activity ---
 
 class MainActivity : ComponentActivity() {
+    @SuppressLint("SourceLockedOrientationActivity")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 🔒 Заключване в Portrait режим
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         enableEdgeToEdge()
         Configuration.getInstance().userAgentValue = packageName
 
@@ -355,8 +363,60 @@ fun MainScreen() {
                 setMultiTouchControls(true)
                 controller.setZoom(15.0)
                 controller.setCenter(searchCenterGeoPoint)
-                overlays.add(mapEventsOverlay)
             }
+        }
+
+        // 🧭 СИСТЕМЕН СЕНЗОР ЗА ВЪРТЕНЕ НА КАРТАТА С SENSORMANAGER
+        val sensorManager = remember { context.getSystemService(Context.SENSOR_SERVICE) as SensorManager }
+        val rotationSensor = remember { sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR) }
+
+        DisposableEffect(sensorManager, rotationSensor) {
+            if (rotationSensor == null) {
+                onDispose { }
+            } else {
+                var lastAzimuth = 0f
+
+                val listener = object : SensorEventListener {
+                    override fun onSensorChanged(event: SensorEvent?) {
+                        if (event?.sensor?.type == Sensor.TYPE_ROTATION_VECTOR) {
+                            val rotationMatrix = FloatArray(9)
+                            SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+
+                            val orientation = FloatArray(3)
+                            SensorManager.getOrientation(rotationMatrix, orientation)
+
+                            // Превръщаме в градуси 0 - 360
+                            var azimuth = Math.toDegrees(orientation[0].toDouble()).toFloat()
+                            if (azimuth < 0) azimuth += 360f
+
+                            // Опресняваме само при промяна над 1.5 градуса
+                            if (abs(azimuth - lastAzimuth) > 1.5f) {
+                                lastAzimuth = azimuth
+                                mapView.post {
+                                    mapView.mapOrientation = -azimuth
+                                    mapView.invalidate() // ⚡ Задължително за да се преначертае картата!
+                                }
+                            }
+                        }
+                    }
+
+                    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+                }
+
+                sensorManager.registerListener(
+                    listener,
+                    rotationSensor,
+                    SensorManager.SENSOR_DELAY_GAME
+                )
+
+                onDispose {
+                    sensorManager.unregisterListener(listener)
+                }
+            }
+        }
+
+        LaunchedEffect(Unit) {
+            mapView.overlays.add(mapEventsOverlay)
         }
 
         // Прилагане на тъмен режим върху картата
@@ -681,7 +741,7 @@ fun MainScreen() {
                     }
                 }
 
-                // 2. БУТОН ЗА ТЕМА (ДНЕВНА / НОЩНА) С ЗАПАМЕТЯВАНЕ
+                // 2. БУТОН ЗА ТЕМА (ДНЕВНА / НОЩНА)
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -732,7 +792,7 @@ fun MainScreen() {
                     }
                 }
 
-                // 4. ПРЕМИУМ БУТОН ЗА ОПРЕСНЯВАНЕ
+                // 4. БУТОН ЗА ОПРЕСНЯВАНЕ
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -843,8 +903,9 @@ fun MainScreen() {
                                     • Паметници
 
                                     🌟 Възможности:
+                                    • Динамичен компас и ориентация на картата спрямо устройството.
                                     • Регулиране на радиуса на търсене от 1.0 до 5.0 км.
-                                    • Перевключване между Дневна и Нощна тема с автоматично инвертиране на картата.
+                                    • Дневна и Нощна тема с автоматична промяна на картата.
                                     • Сканиране на произволна точка с продължително натискане (Long Press) върху картата.
                                     • Поддръжка на български и английски език.
                                     """.trimIndent()
@@ -873,8 +934,9 @@ fun MainScreen() {
                                     • Monuments
 
                                     🌟 Features:
+                                    • Dynamic compass and real-time device map orientation.
                                     • Search radius adjustment from 1.0 to 5.0 km.
-                                    • Day / Night theme mode with map inversion.
+                                    • Day / Night mode with automatic map contrast adjustment.
                                     • Scan any custom location with a long press on the map.
                                     • Bulgarian and English language support.
                                     """.trimIndent()
