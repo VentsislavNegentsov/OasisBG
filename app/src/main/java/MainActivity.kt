@@ -7,6 +7,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
@@ -23,7 +25,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -167,7 +171,7 @@ interface OverpassApi {
                 .readTimeout(10, TimeUnit.SECONDS)
                 .addInterceptor { chain ->
                     val request = chain.request().newBuilder()
-                        .header("User-Agent", "OasisUrban-MobileApp/3.3 (Android)")
+                        .header("User-Agent", "OasisUrban-CitySpotMap/3.5 (Android)")
                         .build()
                     chain.proceed(request)
                 }
@@ -284,9 +288,7 @@ class MainActivity : ComponentActivity() {
         Configuration.getInstance().userAgentValue = packageName
 
         setContent {
-            MaterialTheme {
-                MainScreen()
-            }
+            MainScreen()
         }
     }
 }
@@ -296,513 +298,604 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainScreen() {
     val context = LocalContext.current
-    val coroutineScope = rememberCoroutineScope()
-    val api = remember { OverpassApi.create() }
+    val prefs = remember { context.getSharedPreferences("OasisUrbanPrefs", Context.MODE_PRIVATE) }
 
-    val cacheList = remember { mutableStateListOf<CachedAreaResult>() }
-
-    var currentLanguage by remember { mutableStateOf(AppLanguage.BG) }
-    var selectedMainCategory by remember { mutableStateOf(MainCategory.WATER_HYGIENE) }
-    var selectedPoiCategory by remember { mutableStateOf(PoiCategory.FOUNTAINS) }
-    var radiusKm by remember { mutableStateOf(3.0f) }
-
-    var isLoading by remember { mutableStateOf(false) }
-    var activeJob by remember { mutableStateOf<Job?>(null) }
-
-    var showMenu by remember { mutableStateOf(false) }
-    var showAboutDialog by remember { mutableStateOf(false) }
-
-    var searchCenterGeoPoint by remember { mutableStateOf(GeoPoint(42.6977, 23.3219)) }
-
-    fun updateSearchCenterIfMoved(newPoint: GeoPoint) {
-        if (searchCenterGeoPoint.distanceToAsDouble(newPoint) > 50.0) {
-            searchCenterGeoPoint = newPoint
-        }
+    var isDarkMode by remember {
+        mutableStateOf(prefs.getBoolean("is_dark_mode", false))
     }
 
-    val currentSubCategories = remember(selectedMainCategory) {
-        PoiCategory.entries.filter { it.mainCategory == selectedMainCategory }
-    }
+    MaterialTheme(
+        colorScheme = if (isDarkMode) darkColorScheme() else lightColorScheme()
+    ) {
+        val coroutineScope = rememberCoroutineScope()
+        val api = remember { OverpassApi.create() }
 
-    val mapEventsOverlay = remember {
-        MapEventsOverlay(object : MapEventsReceiver {
-            override fun singleTapConfirmedHelper(p: GeoPoint): Boolean = false
+        val cacheList = remember { mutableStateListOf<CachedAreaResult>() }
 
-            override fun longPressHelper(p: GeoPoint): Boolean {
-                searchCenterGeoPoint = p
-                return true
+        var currentLanguage by remember { mutableStateOf(AppLanguage.BG) }
+        var selectedMainCategory by remember { mutableStateOf(MainCategory.WATER_HYGIENE) }
+        var selectedPoiCategory by remember { mutableStateOf(PoiCategory.FOUNTAINS) }
+
+        var radiusKm by remember { mutableStateOf(2.0f) }
+
+        var isLoading by remember { mutableStateOf(false) }
+        var activeJob by remember { mutableStateOf<Job?>(null) }
+
+        var isInitialSettling by remember { mutableStateOf(true) }
+
+        var showMenu by remember { mutableStateOf(false) }
+        var showAboutDialog by remember { mutableStateOf(false) }
+
+        var searchCenterGeoPoint by remember { mutableStateOf(GeoPoint(42.6977, 23.3219)) }
+
+        fun updateSearchCenterIfMoved(newPoint: GeoPoint) {
+            if (searchCenterGeoPoint.distanceToAsDouble(newPoint) > 50.0) {
+                searchCenterGeoPoint = newPoint
             }
-        })
-    }
-
-    val mapView = remember {
-        MapView(context).apply {
-            setTileSource(TileSourceFactory.MAPNIK)
-            setMultiTouchControls(true)
-            controller.setZoom(15.0)
-            controller.setCenter(searchCenterGeoPoint)
-            overlays.add(mapEventsOverlay)
         }
-    }
 
-    val myLocationOverlay = remember {
-        MyLocationNewOverlay(GpsMyLocationProvider(context), mapView).apply {
-            enableMyLocation()
+        val currentSubCategories = remember(selectedMainCategory) {
+            PoiCategory.entries.filter { it.mainCategory == selectedMainCategory }
         }
-    }
 
-    LaunchedEffect(myLocationOverlay) {
-        myLocationOverlay.runOnFirstFix {
-            val loc = myLocationOverlay.myLocation
-            if (loc != null) {
-                val point = GeoPoint(loc.latitude, loc.longitude)
-                (context as? Activity)?.runOnUiThread {
+        val mapEventsOverlay = remember {
+            MapEventsOverlay(object : MapEventsReceiver {
+                override fun singleTapConfirmedHelper(p: GeoPoint): Boolean = false
+
+                override fun longPressHelper(p: GeoPoint): Boolean {
+                    searchCenterGeoPoint = p
+                    return true
+                }
+            })
+        }
+
+        val mapView = remember {
+            MapView(context).apply {
+                setTileSource(TileSourceFactory.MAPNIK)
+                setMultiTouchControls(true)
+                controller.setZoom(15.0)
+                controller.setCenter(searchCenterGeoPoint)
+                overlays.add(mapEventsOverlay)
+            }
+        }
+
+        // Прилагане на тъмен режим върху картата
+        LaunchedEffect(isDarkMode) {
+            if (isDarkMode) {
+                val inverseMatrix = ColorMatrix(floatArrayOf(
+                    -1.0f, 0.0f, 0.0f, 0.0f, 255.0f,
+                    0.0f, -1.0f, 0.0f, 0.0f, 255.0f,
+                    0.0f, 0.0f, -1.0f, 0.0f, 255.0f,
+                    0.0f, 0.0f, 0.0f, 1.0f, 0.0f
+                ))
+                mapView.overlayManager.tilesOverlay.setColorFilter(ColorMatrixColorFilter(inverseMatrix))
+            } else {
+                mapView.overlayManager.tilesOverlay.setColorFilter(null)
+            }
+            mapView.invalidate()
+        }
+
+        val myLocationOverlay = remember {
+            MyLocationNewOverlay(GpsMyLocationProvider(context), mapView).apply {
+                enableMyLocation()
+            }
+        }
+
+        LaunchedEffect(myLocationOverlay) {
+            myLocationOverlay.runOnFirstFix {
+                val loc = myLocationOverlay.myLocation
+                if (loc != null) {
+                    val point = GeoPoint(loc.latitude, loc.longitude)
+                    (context as? Activity)?.runOnUiThread {
+                        updateSearchCenterIfMoved(point)
+                        mapView.controller.animateTo(point)
+                    }
+                }
+            }
+        }
+
+        LaunchedEffect(Unit) {
+            delay(3000)
+            isInitialSettling = false
+        }
+
+        fun renderCategoryElements(allElements: List<Element>, category: PoiCategory, lang: AppLanguage) {
+            val filtered = allElements.filter { it.belongsToCategory(category) }
+            val poiIcon = createEmojiMarkerIcon(context, category.icon, category.colorHex)
+
+            filtered.forEach { element ->
+                val lat = element.actualLat
+                val lon = element.actualLon
+                if (lat != null && lon != null) {
+                    val marker = Marker(mapView).apply {
+                        position = GeoPoint(lat, lon)
+                        title = element.getLocalizedTitle(category, lang)
+                        snippet = formatSpotDetails(category, element.tags, lang)
+                        icon = poiIcon
+                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                    }
+                    mapView.overlays.add(marker)
+                }
+            }
+            mapView.invalidate()
+
+            if (filtered.isEmpty()) {
+                val msg = if (lang == AppLanguage.BG) {
+                    "Няма намерени '${category.labelBg}' в този радиус"
+                } else {
+                    "No '${category.labelEn}' found in this radius"
+                }
+                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        fun loadOrFilterData(category: PoiCategory, center: GeoPoint, radius: Float, lang: AppLanguage, forceReload: Boolean = false) {
+            activeJob?.cancel()
+
+            mapView.overlays.clear()
+            mapView.overlays.add(mapEventsOverlay)
+            mapView.overlays.add(myLocationOverlay)
+
+            val radiusMeters = (radius * 1000).toInt()
+            val centerMarker = Marker(mapView).apply {
+                position = center
+                title = if (lang == AppLanguage.BG) "Избрана локация" else "Selected location"
+                snippet = if (lang == AppLanguage.BG) "Център (радиус ${String.format("%.1f", radius)} км)" else "Center (radius ${String.format("%.1f", radius)} km)"
+                icon = createEmojiMarkerIcon(context, "📍", "#D32F2F")
+                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+            }
+            mapView.overlays.add(centerMarker)
+
+            val circle = Polygon().apply {
+                points = Polygon.pointsAsCircle(center, radiusMeters.toDouble())
+                fillPaint.color = Color.argb(35, 33, 150, 243)
+                outlinePaint.color = Color.argb(120, 33, 150, 243)
+                outlinePaint.strokeWidth = 3f
+            }
+            mapView.overlays.add(circle)
+            mapView.invalidate()
+
+            if (!forceReload) {
+                val cachedHit = cacheList.firstOrNull { cached ->
+                    center.distanceToAsDouble(cached.center) < 500.0 && abs(cached.radiusKm - radius) < 0.2f
+                }
+
+                if (cachedHit != null) {
+                    renderCategoryElements(cachedHit.elements, category, lang)
+                    return
+                }
+            }
+
+            activeJob = coroutineScope.launch {
+                isLoading = true
+                try {
+                    val query = buildUnifiedOverpassQuery(center.latitude, center.longitude, radiusMeters)
+
+                    var bestResponse: OverpassResponse? = null
+                    var lastException: Exception? = null
+
+                    for (serverUrl in OVERPASS_SERVERS) {
+                        var attemptSuccess = false
+
+                        for (attempt in 1..5) {
+                            try {
+                                val res = api.getNodes(serverUrl, query)
+                                if (res.elements.isNotEmpty()) {
+                                    bestResponse = res
+                                    attemptSuccess = true
+                                    break
+                                } else if (bestResponse == null) {
+                                    bestResponse = res
+                                    attemptSuccess = true
+                                }
+                            } catch (e: Exception) {
+                                if (e is CancellationException) throw e
+                                lastException = e
+                                Log.w("OasisUrban", "Опит $attempt/5 за $serverUrl пропадна: ${e.message}")
+                                delay(1000)
+                            }
+                        }
+
+                        if (attemptSuccess && bestResponse?.elements?.isNotEmpty() == true) {
+                            break
+                        }
+                    }
+
+                    val finalResponse = bestResponse ?: throw (lastException ?: Exception(
+                        if (lang == AppLanguage.BG) "Няма връзка със сървърите." else "No server connection."
+                    ))
+
+                    cacheList.add(CachedAreaResult(center, radius, finalResponse.elements))
+                    renderCategoryElements(finalResponse.elements, category, lang)
+
+                } catch (e: CancellationException) {
+                    // Игнориране при отменена корутина
+                } catch (e: Exception) {
+                    Log.e("OasisUrban", "Грешка при зареждане", e)
+                    val errPrefix = if (lang == AppLanguage.BG) "Мрежова грешка: " else "Network error: "
+                    Toast.makeText(context, "$errPrefix${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                } finally {
+                    isLoading = false
+                }
+            }
+        }
+
+        val locationPermissionLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.RequestMultiplePermissions()
+        ) { permissions ->
+            if (permissions.values.contains(true)) {
+                myLocationOverlay.enableMyLocation()
+                getUserLocation(context)?.let { userLocation ->
+                    val point = GeoPoint(userLocation.latitude, userLocation.longitude)
                     updateSearchCenterIfMoved(point)
                     mapView.controller.animateTo(point)
                 }
             }
         }
-    }
 
-    fun renderCategoryElements(allElements: List<Element>, category: PoiCategory, lang: AppLanguage) {
-        val filtered = allElements.filter { it.belongsToCategory(category) }
-        val poiIcon = createEmojiMarkerIcon(context, category.icon, category.colorHex)
-
-        filtered.forEach { element ->
-            val lat = element.actualLat
-            val lon = element.actualLon
-            if (lat != null && lon != null) {
-                val marker = Marker(mapView).apply {
-                    position = GeoPoint(lat, lon)
-                    title = element.getLocalizedTitle(category, lang)
-                    snippet = formatSpotDetails(category, element.tags, lang)
-                    icon = poiIcon
-                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                }
-                mapView.overlays.add(marker)
-            }
-        }
-        mapView.invalidate()
-
-        if (filtered.isEmpty()) {
-            val msg = if (lang == AppLanguage.BG) {
-                "Няма намерени '${category.labelBg}' в този радиус"
-            } else {
-                "No '${category.labelEn}' found in this radius"
-            }
-            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    fun loadOrFilterData(category: PoiCategory, center: GeoPoint, radius: Float, lang: AppLanguage, forceReload: Boolean = false) {
-        activeJob?.cancel()
-
-        mapView.overlays.clear()
-        mapView.overlays.add(mapEventsOverlay)
-        mapView.overlays.add(myLocationOverlay)
-
-        val radiusMeters = (radius * 1000).toInt()
-        val centerMarker = Marker(mapView).apply {
-            position = center
-            title = if (lang == AppLanguage.BG) "Избрана локация" else "Selected location"
-            snippet = if (lang == AppLanguage.BG) "Център (радиус ${String.format("%.1f", radius)} км)" else "Center (radius ${String.format("%.1f", radius)} km)"
-            icon = createEmojiMarkerIcon(context, "📍", "#D32F2F")
-            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-        }
-        mapView.overlays.add(centerMarker)
-
-        val circle = Polygon().apply {
-            points = Polygon.pointsAsCircle(center, radiusMeters.toDouble())
-            fillPaint.color = Color.argb(35, 33, 150, 243)
-            outlinePaint.color = Color.argb(120, 33, 150, 243)
-            outlinePaint.strokeWidth = 3f
-        }
-        mapView.overlays.add(circle)
-        mapView.invalidate()
-
-        if (!forceReload) {
-            val cachedHit = cacheList.firstOrNull { cached ->
-                center.distanceToAsDouble(cached.center) < 500.0 && abs(cached.radiusKm - radius) < 0.2f
-            }
-
-            if (cachedHit != null) {
-                renderCategoryElements(cachedHit.elements, category, lang)
-                return
-            }
-        }
-
-        activeJob = coroutineScope.launch {
-            isLoading = true
-            try {
-                val query = buildUnifiedOverpassQuery(center.latitude, center.longitude, radiusMeters)
-
-                var bestResponse: OverpassResponse? = null
-                var lastException: Exception? = null
-
-                for (serverUrl in OVERPASS_SERVERS) {
-                    var attemptSuccess = false
-
-                    for (attempt in 1..5) {
-                        try {
-                            val res = api.getNodes(serverUrl, query)
-                            if (res.elements.isNotEmpty()) {
-                                bestResponse = res
-                                attemptSuccess = true
-                                break
-                            } else if (bestResponse == null) {
-                                bestResponse = res
-                                attemptSuccess = true
-                            }
-                        } catch (e: Exception) {
-                            if (e is CancellationException) throw e
-                            lastException = e
-                            Log.w("OasisUrban", "Опит $attempt/5 за $serverUrl пропадна: ${e.message}")
-                            delay(1000) // Пауза от 1 сек между опита за избягване на Rate Limit
-                        }
-                    }
-
-                    if (attemptSuccess && bestResponse?.elements?.isNotEmpty() == true) {
-                        break
-                    }
-                }
-
-                val finalResponse = bestResponse ?: throw (lastException ?: Exception(
-                    if (lang == AppLanguage.BG) "Няма връзка със сървърите." else "No server connection."
-                ))
-
-                cacheList.add(CachedAreaResult(center, radius, finalResponse.elements))
-                renderCategoryElements(finalResponse.elements, category, lang)
-
-            } catch (e: CancellationException) {
-                // Отменена от следващо действие
-            } catch (e: Exception) {
-                Log.e("OasisUrban", "Грешка при зареждане", e)
-                val errPrefix = if (lang == AppLanguage.BG) "Мрежова грешка: " else "Network error: "
-                Toast.makeText(context, "$errPrefix${e.localizedMessage}", Toast.LENGTH_LONG).show()
-            } finally {
-                isLoading = false
-            }
-        }
-    }
-
-    val locationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        if (permissions.values.contains(true)) {
-            myLocationOverlay.enableMyLocation()
-            getUserLocation(context)?.let { userLocation ->
-                val point = GeoPoint(userLocation.latitude, userLocation.longitude)
-                updateSearchCenterIfMoved(point)
-                mapView.controller.animateTo(point)
-            }
-        }
-    }
-
-    LaunchedEffect(Unit) {
-        locationPermissionLauncher.launch(
-            arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION
+        LaunchedEffect(Unit) {
+            locationPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
             )
-        )
-    }
+        }
 
-    // Debounce от 500ms за предотвратяване на лавина от заявки при първоначално зареждане
-    LaunchedEffect(selectedPoiCategory, searchCenterGeoPoint, radiusKm, currentLanguage) {
-        delay(500)
-        loadOrFilterData(selectedPoiCategory, searchCenterGeoPoint, radiusKm, currentLanguage)
-    }
+        LaunchedEffect(selectedPoiCategory, searchCenterGeoPoint, radiusKm, currentLanguage, isInitialSettling) {
+            if (isInitialSettling) return@LaunchedEffect
+            delay(500)
+            loadOrFilterData(selectedPoiCategory, searchCenterGeoPoint, radiusKm, currentLanguage)
+        }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        AndroidView(
-            factory = { mapView },
-            modifier = Modifier.fillMaxSize()
-        )
+        Box(modifier = Modifier.fillMaxSize()) {
+            AndroidView(
+                factory = { mapView },
+                modifier = Modifier.fillMaxSize()
+            )
 
-        // ГОРНО МЕНЮ С КАТЕГОРИИ И БУТОН ЗА 3 ТОЧКИ (⋮)
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .statusBarsPadding()
-                .padding(top = 8.dp)
-        ) {
-            Surface(
+            // ГОРНО МЕНЮ С КАТЕГОРИИ
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp),
-                shape = RoundedCornerShape(20.dp),
-                shadowElevation = 8.dp,
-                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                    .statusBarsPadding()
+                    .padding(top = 8.dp)
             ) {
-                Column(modifier = Modifier.padding(vertical = 6.dp)) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp),
+                    shape = RoundedCornerShape(20.dp),
+                    shadowElevation = 8.dp,
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                ) {
+                    Column(modifier = Modifier.padding(vertical = 6.dp)) {
 
-                    // РЕД 1: Главни Групи + Меню с 3 точки
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        LazyRow(
-                            modifier = Modifier.weight(1f).padding(start = 8.dp),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            items(MainCategory.entries) { mainCat ->
-                                FilterChip(
-                                    selected = selectedMainCategory == mainCat,
-                                    onClick = {
-                                        selectedMainCategory = mainCat
-                                        val firstSub = PoiCategory.entries.firstOrNull { it.mainCategory == mainCat }
-                                        if (firstSub != null) {
-                                            selectedPoiCategory = firstSub
+                            LazyRow(
+                                modifier = Modifier.weight(1f).padding(start = 8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                items(MainCategory.entries) { mainCat ->
+                                    FilterChip(
+                                        selected = selectedMainCategory == mainCat,
+                                        onClick = {
+                                            selectedMainCategory = mainCat
+                                            val firstSub = PoiCategory.entries.firstOrNull { it.mainCategory == mainCat }
+                                            if (firstSub != null) {
+                                                selectedPoiCategory = firstSub
+                                            }
+                                        },
+                                        label = { Text("${mainCat.icon} ${mainCat.label(currentLanguage)}", fontSize = 13.sp) }
+                                    )
+                                }
+                            }
+
+                            Box(modifier = Modifier.padding(end = 4.dp)) {
+                                IconButton(onClick = { showMenu = true }) {
+                                    Text("⋮", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                                }
+
+                                DropdownMenu(
+                                    expanded = showMenu,
+                                    onDismissRequest = { showMenu = false }
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text(if (currentLanguage == AppLanguage.BG) "За приложението" else "About") },
+                                        onClick = {
+                                            showMenu = false
+                                            showAboutDialog = true
                                         }
-                                    },
-                                    label = { Text("${mainCat.icon} ${mainCat.label(currentLanguage)}", fontSize = 13.sp) }
-                                )
+                                    )
+                                    HorizontalDivider()
+                                    DropdownMenuItem(
+                                        text = { Text(if (currentLanguage == AppLanguage.BG) "Изход" else "Exit") },
+                                        onClick = {
+                                            showMenu = false
+                                            (context as? Activity)?.finish()
+                                        }
+                                    )
+                                }
                             }
                         }
 
-                        // Бутон с 3 точки (⋮)
-                        Box(modifier = Modifier.padding(end = 4.dp)) {
-                            IconButton(onClick = { showMenu = true }) {
-                                Text("⋮", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                            }
+                        HorizontalDivider(
+                            modifier = Modifier.padding(vertical = 4.dp, horizontal = 12.dp),
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                        )
 
-                            DropdownMenu(
-                                expanded = showMenu,
-                                onDismissRequest = { showMenu = false }
-                            ) {
-                                DropdownMenuItem(
-                                    text = { Text(if (currentLanguage == AppLanguage.BG) "За приложението" else "About") },
-                                    onClick = {
-                                        showMenu = false
-                                        showAboutDialog = true
-                                    }
-                                )
-                                HorizontalDivider()
-                                DropdownMenuItem(
-                                    text = { Text(if (currentLanguage == AppLanguage.BG) "Изход" else "Exit") },
-                                    onClick = {
-                                        showMenu = false
-                                        (context as? Activity)?.finish()
-                                    }
+                        LazyRow(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            items(currentSubCategories) { poi ->
+                                FilterChip(
+                                    selected = selectedPoiCategory == poi,
+                                    onClick = { selectedPoiCategory = poi },
+                                    label = { Text("${poi.icon} ${poi.label(currentLanguage)}", fontSize = 12.sp) }
                                 )
                             }
                         }
                     }
+                }
 
-                    HorizontalDivider(
-                        modifier = Modifier.padding(vertical = 4.dp, horizontal = 12.dp),
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                if (isLoading) {
+                    LinearProgressIndicator(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 24.dp, vertical = 6.dp)
                     )
+                }
+            }
 
-                    // РЕД 2: Подкатегории
-                    LazyRow(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+            // ДОЛНА КОНТРОЛНА ЛЕНТА
+            Row(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(bottom = 16.dp, start = 8.dp, end = 8.dp)
+                    .fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // 1. БУТОН ЗА СМЯНА НА ЕЗИК
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    shadowElevation = 8.dp,
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                ) {
+                    TextButton(
+                        onClick = {
+                            currentLanguage = if (currentLanguage == AppLanguage.BG) AppLanguage.EN else AppLanguage.BG
+                        },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
                     ) {
-                        items(currentSubCategories) { poi ->
-                            FilterChip(
-                                selected = selectedPoiCategory == poi,
-                                onClick = { selectedPoiCategory = poi },
-                                label = { Text("${poi.icon} ${poi.label(currentLanguage)}", fontSize = 12.sp) }
+                        Text(
+                            text = if (currentLanguage == AppLanguage.BG) "🇧🇬 BG" else "🇬🇧 EN",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+
+                // 2. БУТОН ЗА ТЕМА (ДНЕВНА / НОЩНА) С ЗАПАМЕТЯВАНЕ
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    shadowElevation = 8.dp,
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                ) {
+                    IconButton(
+                        onClick = {
+                            isDarkMode = !isDarkMode
+                            prefs.edit().putBoolean("is_dark_mode", isDarkMode).apply()
+                        }
+                    ) {
+                        Text(
+                            text = if (isDarkMode) "🌙" else "☀️",
+                            fontSize = 18.sp
+                        )
+                    }
+                }
+
+                // 3. СЛАЙДЕР ЗА РАДИУС
+                Surface(
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(18.dp),
+                    shadowElevation = 8.dp,
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            text = if (currentLanguage == AppLanguage.BG) {
+                                "Радиус: ${String.format("%.1f", radiusKm)} км"
+                            } else {
+                                "Radius: ${String.format("%.1f", radiusKm)} km"
+                            },
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Slider(
+                            value = radiusKm,
+                            onValueChange = { radiusKm = it },
+                            valueRange = 1.0f..5.0f,
+                            steps = 7,
+                            modifier = Modifier.height(22.dp)
+                        )
+                    }
+                }
+
+                // 4. ПРЕМИУМ БУТОН ЗА ОПРЕСНЯВАНЕ
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    shadowElevation = 8.dp,
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                ) {
+                    IconButton(
+                        onClick = {
+                            if (!isInitialSettling && !isLoading) {
+                                loadOrFilterData(selectedPoiCategory, searchCenterGeoPoint, radiusKm, currentLanguage, forceReload = true)
+                            }
+                        },
+                        enabled = !isLoading
+                    ) {
+                        if (isLoading) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.5.dp,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        } else {
+                            Text(
+                                text = "🔄",
+                                fontSize = 16.sp
                             )
                         }
                     }
                 }
+
+                // 5. БУТОН ЗА ТЕКУЩА ПОЗИЦИЯ (GPS)
+                Surface(
+                    shape = RoundedCornerShape(18.dp),
+                    shadowElevation = 8.dp,
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                ) {
+                    IconButton(
+                        onClick = {
+                            val myLoc = myLocationOverlay.myLocation
+                            val geoPoint = if (myLoc != null) {
+                                GeoPoint(myLoc.latitude, myLoc.longitude)
+                            } else {
+                                getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
+                            }
+
+                            if (geoPoint != null) {
+                                searchCenterGeoPoint = geoPoint
+                                mapView.controller.animateTo(geoPoint)
+                            } else {
+                                val msg = if (currentLanguage == AppLanguage.BG) "Търсене на GPS сигнал..." else "Searching for GPS signal..."
+                                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    ) {
+                        Text("🎯", fontSize = 18.sp)
+                    }
+                }
             }
 
-            if (isLoading) {
-                LinearProgressIndicator(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 24.dp, vertical = 6.dp)
+            // ДИАЛОГ "ABOUT" С ВЕРТИКАЛЕН СКРОЛ
+            if (showAboutDialog) {
+                val scrollState = rememberScrollState()
+
+                AlertDialog(
+                    onDismissRequest = { showAboutDialog = false },
+                    title = {
+                        Column {
+                            Text(
+                                text = "Oasis Urban: City Spot Map",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 18.sp
+                            )
+                            Text(
+                                text = "by Ventsislav Negentsov",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    },
+                    text = {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .verticalScroll(scrollState)
+                        ) {
+                            Text(
+                                text = if (currentLanguage == AppLanguage.BG) {
+                                    """
+                                    Oasis Urban: City Spot Map е твоят интерактивен градски помощник за бързо и лесно откриване на обекти около теб.
+
+                                    🌟 Достъпни обекти за търсене:
+                                    • Чешми
+                                    • Тоалетни
+                                    • Извори
+                                    • Пейки
+                                    • Детски площадки
+                                    • Външни фитнеси
+                                    • Кучешки паркове
+                                    • Зони за пикник
+                                    • Панорамни гледки
+                                    • Зарядни станции за електромобили
+                                    • Велостойки
+                                    • Колела под наем
+                                    • Станции за велоремонт
+                                    • Контейнери за рециклиране
+                                    • Стрийт арт
+                                    • Улични библиотеки
+                                    • Шкафчета за пратки
+                                    • Паметници
+
+                                    🌟 Възможности:
+                                    • Регулиране на радиуса на търсене от 1.0 до 5.0 км.
+                                    • Перевключване между Дневна и Нощна тема с автоматично инвертиране на картата.
+                                    • Сканиране на произволна точка с продължително натискане (Long Press) върху картата.
+                                    • Поддръжка на български и английски език.
+                                    """.trimIndent()
+                                } else {
+                                    """
+                                    Oasis Urban: City Spot Map is your interactive urban companion for discovering useful spots around you.
+
+                                    🌟 Searchable Spot Types:
+                                    • Drinking Fountains
+                                    • Public Toilets
+                                    • Water Springs
+                                    • Benches
+                                    • Playgrounds
+                                    • Outdoor Gyms
+                                    • Dog Parks
+                                    • Picnic Areas
+                                    • Viewpoints
+                                    • EV Charging Stations
+                                    • Bicycle Parking
+                                    • Bike Rental Stations
+                                    • Bike Repair Stations
+                                    • Recycling Containers
+                                    • Street Art
+                                    • Public Bookcases
+                                    • Parcel Lockers
+                                    • Monuments
+
+                                    🌟 Features:
+                                    • Search radius adjustment from 1.0 to 5.0 km.
+                                    • Day / Night theme mode with map inversion.
+                                    • Scan any custom location with a long press on the map.
+                                    • Bulgarian and English language support.
+                                    """.trimIndent()
+                                },
+                                fontSize = 13.sp,
+                                lineHeight = 18.sp
+                            )
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showAboutDialog = false }) {
+                            Text(if (currentLanguage == AppLanguage.BG) "Затвори" else "Close")
+                        }
+                    }
                 )
             }
-        }
-
-        // ДОЛНА КОНТРОЛНА ЛЕНТА
-        Surface(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
-                .padding(bottom = 16.dp, start = 12.dp, end = 12.dp)
-                .fillMaxWidth(),
-            shape = RoundedCornerShape(20.dp),
-            shadowElevation = 8.dp,
-            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
-        ) {
-            Row(
-                modifier = Modifier
-                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                    .fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                TextButton(
-                    onClick = {
-                        currentLanguage = if (currentLanguage == AppLanguage.BG) AppLanguage.EN else AppLanguage.BG
-                    },
-                    contentPadding = PaddingValues(horizontal = 8.dp)
-                ) {
-                    Text(
-                        text = if (currentLanguage == AppLanguage.BG) "🇧🇬 BG" else "🇬🇧 EN",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 13.sp
-                    )
-                }
-
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(horizontal = 8.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        text = if (currentLanguage == AppLanguage.BG) {
-                            "Радиус: ${String.format("%.1f", radiusKm)} км"
-                        } else {
-                            "Radius: ${String.format("%.1f", radiusKm)} km"
-                        },
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Slider(
-                        value = radiusKm,
-                        onValueChange = { radiusKm = it },
-                        valueRange = 1.0f..6.0f,
-                        steps = 9,
-                        modifier = Modifier.height(22.dp)
-                    )
-                }
-
-                // Ръчно презареждане
-                IconButton(
-                    onClick = {
-                        loadOrFilterData(selectedPoiCategory, searchCenterGeoPoint, radiusKm, currentLanguage, forceReload = true)
-                    }
-                ) {
-                    Text("🔄", fontSize = 16.sp)
-                }
-
-                // Центриране по GPS
-                IconButton(
-                    onClick = {
-                        val myLoc = myLocationOverlay.myLocation
-                        val geoPoint = if (myLoc != null) {
-                            GeoPoint(myLoc.latitude, myLoc.longitude)
-                        } else {
-                            getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
-                        }
-
-                        if (geoPoint != null) {
-                            searchCenterGeoPoint = geoPoint
-                            mapView.controller.animateTo(geoPoint)
-                        } else {
-                            val msg = if (currentLanguage == AppLanguage.BG) "Търсене на GPS сигнал..." else "Searching for GPS signal..."
-                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                ) {
-                    Text("🎯", fontSize = 18.sp)
-                }
-            }
-        }
-
-        // ДИАЛОГ "ABOUT" / "ЗА ПРИЛОЖЕНИЕТО"
-        if (showAboutDialog) {
-            AlertDialog(
-                onDismissRequest = { showAboutDialog = false },
-                title = {
-                    Column {
-                        Text(
-                            text = "Oasis Urban: City Spot Map",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 18.sp
-                        )
-                        Text(
-                            text = "by Ventsislav Negentsov",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                },
-                text = {
-                    Text(
-                        text = if (currentLanguage == AppLanguage.BG) {
-                            """
-                            Oasis Urban е твоят интерактивен градски помощник за бързо и лесно откриване на обекти около теб.
-
-                            🌟 Достъпни обекти за търсене:
-                            • Чешми
-                            • Тоалетни
-                            • Извори
-                            • Пейки
-                            • Детски площадки
-                            • Външни фитнеси
-                            • Кучешки паркове
-                            • Зони за пикник
-                            • Панорамни гледки
-                            • Зарядни станции за електромобили
-                            • Велостойки
-                            • Колела под наем
-                            • Станции за велоремонт
-                            • Контейнери за рециклиране
-                            • Стрийт арт
-                            • Улични библиотеки
-                            • Шкафчета за пратки
-                            • Паметници
-
-                            🌟 Възможности:
-                            • Регулиране на радиуса на търсене от 1.0 до 6.0 км.
-                            • Сканиране на произволна точка с продължително натискане (Long Press) върху картата.
-                            • Поддръжка на български и английски език.
-                            """.trimIndent()
-                        } else {
-                            """
-                            Oasis Urban is your interactive urban companion for discovering useful spots around you.
-
-                            🌟 Searchable Spot Types:
-                            • Drinking Fountains
-                            • Public Toilets
-                            • Water Springs
-                            • Benches
-                            • Playgrounds
-                            • Outdoor Gyms
-                            • Dog Parks
-                            • Picnic Areas
-                            • Viewpoints
-                            • EV Charging Stations
-                            • Bicycle Parking
-                            • Bike Rental Stations
-                            • Bike Repair Stations
-                            • Recycling Containers
-                            • Street Art
-                            • Public Bookcases
-                            • Parcel Lockers
-                            • Monuments
-
-                            🌟 Features:
-                            • Search radius adjustment from 1.0 to 6.0 km.
-                            • Scan any custom location with a long press on the map.
-                            • Bulgarian and English language support.
-                            """.trimIndent()
-                        },
-                        fontSize = 13.sp,
-                        lineHeight = 18.sp
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = { showAboutDialog = false }) {
-                        Text(if (currentLanguage == AppLanguage.BG) "Затвори" else "Close")
-                    }
-                }
-            )
         }
     }
 }
 
-// --- 5. Помощни функции ---
+// --- 5. Помощни функции за локация ---
 
 @SuppressLint("MissingPermission")
 private fun getUserLocation(context: Context): Location? {
