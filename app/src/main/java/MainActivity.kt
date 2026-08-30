@@ -3,7 +3,11 @@ package com.oasisbg
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.location.Location
 import android.location.LocationManager
@@ -24,8 +28,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.content.ContextCompat
-import androidx.core.graphics.drawable.DrawableCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -50,12 +52,21 @@ import java.util.concurrent.TimeUnit
 
 // --- 1. Модели за данни & Retrofit API ---
 
+data class Center(
+    val lat: Double,
+    val lon: Double
+)
+
 data class Element(
     val id: Long,
-    val lat: Double,
-    val lon: Double,
+    val lat: Double?,
+    val lon: Double?,
+    val center: Center?,
     val tags: Map<String, String>?
-)
+) {
+    val actualLat: Double? get() = lat ?: center?.lat
+    val actualLon: Double? get() = lon ?: center?.lon
+}
 
 data class OverpassResponse(val elements: List<Element>)
 
@@ -90,11 +101,11 @@ interface OverpassApi {
     companion object {
         fun create(): OverpassApi {
             val okHttpClient = OkHttpClient.Builder()
-                .connectTimeout(25, TimeUnit.SECONDS)
-                .readTimeout(25, TimeUnit.SECONDS)
+                .connectTimeout(40, TimeUnit.SECONDS)
+                .readTimeout(40, TimeUnit.SECONDS)
                 .addInterceptor { chain ->
                     val request = chain.request().newBuilder()
-                        .header("User-Agent", "OasisBG-MobileApp/1.5 (Android)")
+                        .header("User-Agent", "OasisBG-MobileApp/1.8 (Android)")
                         .build()
                     chain.proceed(request)
                 }
@@ -110,14 +121,36 @@ interface OverpassApi {
     }
 }
 
-// --- 2. Помощни функции за UI и Маркери ---
+// --- 2. Генератор на иконки с емоджита ---
 
-private fun getTintedMarkerIcon(context: Context, colorHex: String): Drawable? {
-    val drawable = ContextCompat.getDrawable(context, org.osmdroid.library.R.drawable.marker_default)?.mutate()
-    if (drawable != null) {
-        DrawableCompat.setTint(drawable, Color.parseColor(colorHex))
+private fun createEmojiMarkerIcon(context: Context, emoji: String, backgroundColorHex: String): Drawable {
+    val density = context.resources.displayMetrics.density
+    val sizePx = (42 * density).toInt()
+    val bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bitmap)
+
+    val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor(backgroundColorHex)
+        style = Paint.Style.FILL
     }
-    return drawable
+    val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        style = Paint.Style.STROKE
+        strokeWidth = 2.5f * density
+    }
+
+    val radius = (sizePx / 2f) - (2 * density)
+    canvas.drawCircle(sizePx / 2f, sizePx / 2f, radius, bgPaint)
+    canvas.drawCircle(sizePx / 2f, sizePx / 2f, radius, strokePaint)
+
+    val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = 20f * density
+        textAlign = Paint.Align.CENTER
+    }
+    val textY = (sizePx / 2f) - ((textPaint.descent() + textPaint.ascent()) / 2f)
+    canvas.drawText(emoji, sizePx / 2f, textY, textPaint)
+
+    return BitmapDrawable(context.resources, bitmap)
 }
 
 private fun formatSpotDetails(category: MapCategory, tags: Map<String, String>?): String {
@@ -168,7 +201,7 @@ fun MainScreen() {
     var isLoading by remember { mutableStateOf(false) }
     var activeJob by remember { mutableStateOf<Job?>(null) }
 
-    var searchCenterGeoPoint by remember { mutableStateOf(GeoPoint(42.6977, 23.3219)) } // София
+    var searchCenterGeoPoint by remember { mutableStateOf(GeoPoint(42.6977, 23.3219)) }
 
     val mapEventsOverlay = remember {
         MapEventsOverlay(object : MapEventsReceiver {
@@ -203,19 +236,30 @@ fun MainScreen() {
         activeJob = coroutineScope.launch {
             isLoading = true
             try {
+                // Търсене по точки (node), площи (way) и релации (relation)
                 val query = """
-                    [out:json][timeout:25];
-                    node["${category.osmKey}"="${category.osmValue}"](around:3000,${center.latitude},${center.longitude});
-                    out body;
+                    [out:json][timeout:40];
+                    (
+                      node["${category.osmKey}"="${category.osmValue}"](around:3000,${center.latitude},${center.longitude});
+                      way["${category.osmKey}"="${category.osmValue}"](around:3000,${center.latitude},${center.longitude});
+                      relation["${category.osmKey}"="${category.osmValue}"](around:3000,${center.latitude},${center.longitude});
+                    );
+                    out center;
                 """.trimIndent()
 
-                var response: OverpassResponse? = null
+                var bestResponse: OverpassResponse? = null
                 var lastException: Exception? = null
 
+                // Опитване на сървърите. Ако даден сървър върне празен отговор, се продължава към следващия.
                 for (serverUrl in OVERPASS_SERVERS) {
                     try {
-                        response = api.getNodes(serverUrl, query)
-                        if (response != null) break
+                        val res = api.getNodes(serverUrl, query)
+                        if (res.elements.isNotEmpty()) {
+                            bestResponse = res
+                            break
+                        } else if (bestResponse == null) {
+                            bestResponse = res
+                        }
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         lastException = e
@@ -223,54 +267,56 @@ fun MainScreen() {
                     }
                 }
 
-                if (response == null) {
-                    throw lastException ?: Exception("Няма връзка със сървърите.")
-                }
+                val finalResponse = bestResponse ?: throw (lastException ?: Exception("Няма връзка със сървърите."))
 
                 mapView.overlays.clear()
                 mapView.overlays.add(mapEventsOverlay)
                 mapView.overlays.add(myLocationOverlay)
 
-                // 1. Червен маркер за избраната точка на търсене
+                // 1. Иконка 📍 за избраната точка
                 val centerMarker = Marker(mapView).apply {
                     position = center
                     title = "Избрана локация"
                     snippet = "Център на търсене (радиус 3 км)"
-                    icon = getTintedMarkerIcon(context, "#D32F2F") // Ярко червен цвят
-                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    icon = createEmojiMarkerIcon(context, "📍", "#D32F2F")
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                 }
                 mapView.overlays.add(centerMarker)
-                centerMarker.showInfoWindow() // Показва балона за избраната точка автоматично
+                centerMarker.showInfoWindow()
 
                 // 2. Синя прозрачна окръжност
                 val circle = Polygon().apply {
                     points = Polygon.pointsAsCircle(center, 3000.0)
-                    fillColor = Color.argb(35, 33, 150, 243)
-                    strokeColor = Color.argb(120, 33, 150, 243)
-                    strokeWidth = 3f
+                    fillPaint.color = Color.argb(35, 33, 150, 243)
+                    outlinePaint.color = Color.argb(120, 33, 150, 243)
+                    outlinePaint.strokeWidth = 3f
                 }
                 mapView.overlays.add(circle)
 
-                // 3. Цветни маркери за обектите с балон за подробности
-                val poiIcon = getTintedMarkerIcon(context, category.colorHex)
+                // 3. Маркери за обектите
+                val poiIcon = createEmojiMarkerIcon(context, category.icon, category.colorHex)
 
-                if (response.elements.isEmpty()) {
+                if (finalResponse.elements.isEmpty()) {
                     Toast.makeText(context, "Няма намерени обекти от тип '${category.label}'", Toast.LENGTH_SHORT).show()
                 } else {
-                    response.elements.forEach { element ->
-                        val marker = Marker(mapView).apply {
-                            position = GeoPoint(element.lat, element.lon)
-                            title = element.tags?.get("name") ?: "${category.icon} ${category.label}"
-                            snippet = formatSpotDetails(category, element.tags)
-                            icon = poiIcon
-                            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    finalResponse.elements.forEach { element ->
+                        val lat = element.actualLat
+                        val lon = element.actualLon
+                        if (lat != null && lon != null) {
+                            val marker = Marker(mapView).apply {
+                                position = GeoPoint(lat, lon)
+                                title = element.tags?.get("name") ?: "${category.icon} ${category.label}"
+                                snippet = formatSpotDetails(category, element.tags)
+                                icon = poiIcon
+                                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                            }
+                            mapView.overlays.add(marker)
                         }
-                        mapView.overlays.add(marker)
                     }
                 }
                 mapView.invalidate()
             } catch (e: CancellationException) {
-                // Игнорира се анулирането при нов клик
+                // Игнорира се при започване на ново търсене
             } catch (e: Exception) {
                 Log.e("OasisBG", "Грешка при зареждане", e)
                 Toast.makeText(context, "Мрежова грешка: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
@@ -283,11 +329,8 @@ fun MainScreen() {
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-            permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-        ) {
-            val userLocation = getUserLocation(context)
-            if (userLocation != null) {
+        if (permissions.values.contains(true)) {
+            getUserLocation(context)?.let { userLocation ->
                 searchCenterGeoPoint = GeoPoint(userLocation.latitude, userLocation.longitude)
                 mapView.controller.setCenter(searchCenterGeoPoint)
             }
