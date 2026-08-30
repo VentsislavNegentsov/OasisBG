@@ -41,6 +41,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -73,7 +74,7 @@ import retrofit2.http.Url
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
-// --- 1. Модели за данни & Категории ---
+// --- 1. Модели за данни ---
 
 enum class AppLanguage { BG, EN }
 
@@ -114,10 +115,31 @@ data class CachedAreaResult(
     val elements: List<Element>
 )
 
-// --- OSRM Модели за улично рутиране ---
+// --- OSRM Модели за улично рутиране с Turn-by-Turn стъпки ---
 data class OsrmResponse(val routes: List<OsrmRoute>?)
-data class OsrmRoute(val geometry: OsrmGeometry?)
-data class OsrmGeometry(val coordinates: List<List<Double>>?)
+data class OsrmRoute(
+    val geometry: OsrmGeometry?,
+    val legs: List<OsrmLeg>?
+)
+data class OsrmGeometry(
+    val coordinates: List<List<Double>>?
+)
+data class OsrmLeg(val steps: List<OsrmStep>?)
+data class OsrmStep(
+    val distance: Double,
+    val name: String?,
+    val maneuver: OsrmManeuver?
+)
+data class OsrmManeuver(
+    val type: String?,
+    val modifier: String?,
+    val location: List<Double>? // [lon, lat]
+)
+
+data class NavigationData(
+    val points: List<GeoPoint>,
+    val steps: List<OsrmStep>
+)
 
 enum class MainCategory(
     val labelBg: String,
@@ -188,7 +210,7 @@ interface OverpassApi {
                 .readTimeout(10, TimeUnit.SECONDS)
                 .addInterceptor { chain ->
                     val request = chain.request().newBuilder()
-                        .header("User-Agent", "OasisUrban-CitySpotMap/3.6 (Android)")
+                        .header("User-Agent", "OasisUrban-CitySpotMap/3.7 (Android)")
                         .build()
                     chain.proceed(request)
                 }
@@ -206,34 +228,65 @@ interface OverpassApi {
 
 // --- 2. Помощни функции ---
 
-/**
- * Извлича маршрут по улиците от OSRM (Open Source Routing Machine) API.
- */
-suspend fun fetchStreetRoute(start: GeoPoint, target: GeoPoint): List<GeoPoint> = withContext(Dispatchers.IO) {
+suspend fun fetchStreetRouteDetails(start: GeoPoint, target: GeoPoint): NavigationData = withContext(Dispatchers.IO) {
     try {
         val url = "https://router.project-osrm.org/route/v1/foot/" +
                 "${start.longitude},${start.latitude};${target.longitude},${target.latitude}" +
-                "?overview=full&geometries=geojson"
+                "?overview=full&geometries=geojson&steps=true"
 
         val client = OkHttpClient()
         val request = Request.Builder().url(url).build()
         val response = client.newCall(request).execute()
-        val json = response.body?.string() ?: return@withContext listOf(start, target)
+        val json = response.body?.string() ?: return@withContext NavigationData(listOf(start, target), emptyList())
 
         val osrmResponse = Gson().fromJson(json, OsrmResponse::class.java)
-        val coords = osrmResponse.routes?.firstOrNull()?.geometry?.coordinates ?: return@withContext listOf(start, target)
+        val route = osrmResponse.routes?.firstOrNull()
+        val coords = route?.geometry?.coordinates?.map { GeoPoint(it[1], it[0]) } ?: listOf(start, target)
+        val steps = route?.legs?.firstOrNull()?.steps ?: emptyList()
 
-        coords.map { GeoPoint(it[1], it[0]) }
+        NavigationData(coords, steps)
     } catch (e: Exception) {
         Log.e("OasisUrban", "Грешка при извличане на маршрут", e)
-        listOf(start, target)
+        NavigationData(listOf(start, target), emptyList())
     }
 }
 
-/**
- * Създава иконка за маркер.
- * Ако [isSelected] е true, иконката става ПО-ТЪМНА с удебелен жълт контур.
- */
+fun getManeuverDisplay(step: OsrmStep?, lang: AppLanguage): Pair<String, String> {
+    val maneuver = step?.maneuver
+    val modifier = maneuver?.modifier
+    val type = maneuver?.type
+    val streetName = if (!step?.name.isNullOrBlank()) step.name else ""
+
+    val (arrow, text) = when {
+        type == "arrive" -> Pair("🏁", if (lang == AppLanguage.BG) "Пристигате на целта" else "Arriving at destination")
+        modifier == "slight right" -> Pair("↗️", if (lang == AppLanguage.BG) "Леко надясно" else "Slight right")
+        modifier == "right" -> Pair("➡️", if (lang == AppLanguage.BG) "Завийте надясно" else "Turn right")
+        modifier == "sharp right" -> Pair("↳", if (lang == AppLanguage.BG) "Остър десен завой" else "Sharp right")
+        modifier == "slight left" -> Pair("↖️", if (lang == AppLanguage.BG) "Леко наляво" else "Slight left")
+        modifier == "left" -> Pair("⬅️", if (lang == AppLanguage.BG) "Завийте наляво" else "Turn left")
+        modifier == "sharp left" -> Pair("↲", if (lang == AppLanguage.BG) "Остър ляв завой" else "Sharp left")
+        modifier == "uturn" -> Pair("↩️", if (lang == AppLanguage.BG) "Обратен завой" else "U-turn")
+        else -> Pair("⬆️", if (lang == AppLanguage.BG) "Продължете напред" else "Continue straight")
+    }
+
+    val fullText = if (streetName.isNullOrBlank()) text else "$text по $streetName"
+    return Pair(arrow, fullText)
+}
+
+fun updateZoomBasedOnSpeed(mapView: MapView, speedMps: Float) {
+    val speedKmH = speedMps * 3.6f
+    val targetZoom = when {
+        speedKmH < 5f -> 18.5
+        speedKmH < 25f -> 17.0
+        speedKmH < 50f -> 15.5
+        else -> 14.0
+    }
+
+    if (abs(mapView.zoomLevelDouble - targetZoom) > 0.5) {
+        mapView.controller.zoomTo(targetZoom, 500L)
+    }
+}
+
 private fun createEmojiMarkerIcon(
     context: Context,
     emoji: String,
@@ -340,65 +393,6 @@ private fun buildUnifiedOverpassQuery(lat: Double, lon: Double, radiusMeters: In
     """.trimIndent()
 }
 
-/**
- * Пресмята разстоянието и посоката (стрелка) спрямо текущия азимут на компаса.
- */
-private fun calculateGuidanceInfo(
-    userPoint: GeoPoint?,
-    targetPoint: GeoPoint?,
-    azimuth: Float,
-    lang: AppLanguage
-): Pair<String, String> {
-    if (userPoint == null || targetPoint == null) {
-        return Pair("--", "❓")
-    }
-
-    val userLoc = Location("").apply {
-        latitude = userPoint.latitude
-        longitude = userPoint.longitude
-    }
-    val targetLoc = Location("").apply {
-        latitude = targetPoint.latitude
-        longitude = targetPoint.longitude
-    }
-
-    val distMeters = userLoc.distanceTo(targetLoc)
-    val distStr = if (distMeters >= 1000) {
-        String.format("%.2f km", distMeters / 1000f)
-    } else {
-        "${distMeters.toInt()} m"
-    }
-
-    val bearing = userLoc.bearingTo(targetLoc)
-    val relAngle = (bearing - azimuth + 360) % 360
-
-    val arrow = when (relAngle) {
-        in 337.5..360.0, in 0.0..22.5 -> "⬆️"
-        in 22.5..67.5 -> "↗️"
-        in 67.5..112.5 -> "➡️"
-        in 112.5..157.5 -> "↘️"
-        in 157.5..202.5 -> "⬇️"
-        in 202.5..247.5 -> "↙️"
-        in 247.5..292.5 -> "⬅️"
-        in 292.5..337.5 -> "↖️"
-        else -> "⬆️"
-    }
-
-    val dirText = when (relAngle) {
-        in 337.5..360.0, in 0.0..22.5 -> if (lang == AppLanguage.BG) "Право напред" else "Straight Ahead"
-        in 22.5..67.5 -> if (lang == AppLanguage.BG) "Вдясно пред теб" else "Slight Right"
-        in 67.5..112.5 -> if (lang == AppLanguage.BG) "Надясно" else "Turn Right"
-        in 112.5..157.5 -> if (lang == AppLanguage.BG) "Вдясно зад теб" else "Hard Right"
-        in 157.5..202.5 -> if (lang == AppLanguage.BG) "Зад теб" else "Behind You"
-        in 202.5..247.5 -> if (lang == AppLanguage.BG) "Вляво зад теб" else "Hard Left"
-        in 247.5..292.5 -> if (lang == AppLanguage.BG) "Наляво" else "Turn Left"
-        in 292.5..337.5 -> if (lang == AppLanguage.BG) "Вляво пред теб" else "Slight Left"
-        else -> ""
-    }
-
-    return Pair(distStr, "$arrow $dirText")
-}
-
 private fun openGoogleMaps(context: Context, target: GeoPoint, label: String) {
     val uri = Uri.parse("google.navigation:q=${target.latitude},${target.longitude}")
     val intent = Intent(Intent.ACTION_VIEW, uri).apply {
@@ -462,15 +456,14 @@ fun MainScreen() {
 
         var searchCenterGeoPoint by remember { mutableStateOf(GeoPoint(42.6977, 23.3219)) }
 
-        // --- Състояния за Избран Маркер, Route & Guidance Навигация ---
         var currentlySelectedMarker by remember { mutableStateOf<Marker?>(null) }
         var selectedTargetGeoPoint by remember { mutableStateOf<GeoPoint?>(null) }
         var selectedTargetTitle by remember { mutableStateOf<String?>(null) }
         var selectedTargetDetails by remember { mutableStateOf<String?>(null) }
 
         var isGuidanceActive by remember { mutableStateOf(false) }
-        var currentAzimuth by remember { mutableFloatStateOf(0f) }
         var routePoints by remember { mutableStateOf<List<GeoPoint>>(emptyList()) }
+        var navigationSteps by remember { mutableStateOf<List<OsrmStep>>(emptyList()) }
 
         fun updateSearchCenterIfMoved(newPoint: GeoPoint) {
             if (searchCenterGeoPoint.distanceToAsDouble(newPoint) > 50.0) {
@@ -521,7 +514,6 @@ fun MainScreen() {
             }
         }
 
-        // Линия за навигация (Polyline)
         val navigationPolyline = remember {
             Polyline().apply {
                 outlinePaint.color = Color.parseColor("#0288D1")
@@ -529,7 +521,6 @@ fun MainScreen() {
             }
         }
 
-        // 🧭 СЕНЗОР ЗА ВЪРТЕНЕ & ЖИВО ОБНОВЯВАНЕ НА АЗИМУТА
         val sensorManager = remember { context.getSystemService(Context.SENSOR_SERVICE) as SensorManager }
         val rotationSensor = remember { sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR) }
 
@@ -553,7 +544,6 @@ fun MainScreen() {
 
                             if (abs(azimuth - lastAzimuth) > 1.5f) {
                                 lastAzimuth = azimuth
-                                currentAzimuth = azimuth
                                 mapView.post {
                                     mapView.mapOrientation = -azimuth
                                     mapView.invalidate()
@@ -581,7 +571,6 @@ fun MainScreen() {
             mapView.overlays.add(mapEventsOverlay)
         }
 
-        // Прилагане на тъмен режим върху картата
         LaunchedEffect(isDarkMode) {
             if (isDarkMode) {
                 val inverseMatrix = ColorMatrix(floatArrayOf(
@@ -603,7 +592,6 @@ fun MainScreen() {
             }
         }
 
-        // 🛣️ 1. Извличане на уличния маршрут през OSRM API
         LaunchedEffect(isGuidanceActive, selectedTargetGeoPoint) {
             if (isGuidanceActive && selectedTargetGeoPoint != null) {
                 val myLoc = myLocationOverlay.myLocation
@@ -611,14 +599,16 @@ fun MainScreen() {
                 else getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
 
                 if (userPoint != null) {
-                    routePoints = fetchStreetRoute(userPoint, selectedTargetGeoPoint!!)
+                    val navData = fetchStreetRouteDetails(userPoint, selectedTargetGeoPoint!!)
+                    routePoints = navData.points
+                    navigationSteps = navData.steps
                 }
             } else {
                 routePoints = emptyList()
+                navigationSteps = emptyList()
             }
         }
 
-        // 🛣️ 2. Визуализиране на уличния Polyline върху картата
         LaunchedEffect(routePoints) {
             if (routePoints.isNotEmpty()) {
                 navigationPolyline.setPoints(routePoints)
@@ -830,12 +820,35 @@ fun MainScreen() {
                 modifier = Modifier.fillMaxSize()
             )
 
-            // 🧭 1. GUIDANCE HUD ТОР ПАНЕЛ
+            // --- Навигационен Turn-by-Turn банер с автомащабиране ---
             if (isGuidanceActive && selectedTargetGeoPoint != null) {
-                val userPoint = myLocationOverlay.myLocation?.let { GeoPoint(it.latitude, it.longitude) }
-                    ?: getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
+                val userLocation = myLocationOverlay.lastFix
 
-                val (distText, dirText) = calculateGuidanceInfo(userPoint, selectedTargetGeoPoint, currentAzimuth, currentLanguage)
+                userLocation?.let { loc ->
+                    if (loc.hasSpeed()) {
+                        updateZoomBasedOnSpeed(mapView, loc.speed)
+                    }
+                }
+
+                val nextStep = navigationSteps.firstOrNull { step ->
+                    val loc = step.maneuver?.location
+                    if (loc != null && userLocation != null) {
+                        val stepPoint = GeoPoint(loc[1], loc[0])
+                        val userPoint = GeoPoint(userLocation.latitude, userLocation.longitude)
+                        userPoint.distanceToAsDouble(stepPoint) > 15.0
+                    } else true
+                } ?: navigationSteps.lastOrNull()
+
+                val distToNextStepMeters = remember(userLocation, nextStep) {
+                    val loc = nextStep?.maneuver?.location
+                    if (loc != null && userLocation != null) {
+                        val stepPoint = GeoPoint(loc[1], loc[0])
+                        val userPoint = GeoPoint(userLocation.latitude, userLocation.longitude)
+                        userPoint.distanceToAsDouble(stepPoint).toInt()
+                    } else 0
+                }
+
+                val (arrowIcon, instructionText) = getManeuverDisplay(nextStep, currentLanguage)
 
                 Surface(
                     modifier = Modifier
@@ -847,7 +860,7 @@ fun MainScreen() {
                     color = MaterialTheme.colorScheme.primaryContainer
                 ) {
                     Row(
-                        modifier = Modifier.padding(14.dp),
+                        modifier = Modifier.padding(16.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
@@ -856,23 +869,25 @@ fun MainScreen() {
                             modifier = Modifier.weight(1f)
                         ) {
                             Text(
-                                text = dirText.takeWhile { !it.isWhitespace() },
-                                fontSize = 34.sp,
-                                modifier = Modifier.padding(end = 10.dp)
+                                text = arrowIcon,
+                                fontSize = 38.sp,
+                                modifier = Modifier.padding(end = 12.dp)
                             )
                             Column {
+                                if (distToNextStepMeters > 0) {
+                                    Text(
+                                        text = if (currentLanguage == AppLanguage.BG) "След $distToNextStepMeters м" else "In $distToNextStepMeters m",
+                                        fontWeight = FontWeight.ExtraBold,
+                                        fontSize = 18.sp,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                                    )
+                                }
                                 Text(
-                                    text = selectedTargetTitle ?: "",
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 15.sp,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    maxLines = 1
-                                )
-                                Text(
-                                    text = "$distText • ${dirText.dropWhile { !it.isWhitespace() }.trim()}",
-                                    fontSize = 13.sp,
+                                    text = instructionText,
+                                    fontSize = 14.sp,
                                     fontWeight = FontWeight.Medium,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.9f),
+                                    maxLines = 2
                                 )
                             }
                         }
@@ -883,12 +898,11 @@ fun MainScreen() {
                             shape = RoundedCornerShape(16.dp),
                             contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                         ) {
-                            Text(if (currentLanguage == AppLanguage.BG) "Спри" else "Stop", fontSize = 12.sp)
+                            Text(if (currentLanguage == AppLanguage.BG) "Край" else "End", fontSize = 12.sp)
                         }
                     }
                 }
             } else {
-                // ГОРНО МЕНЮ С КАТЕГОРИИ
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -986,7 +1000,6 @@ fun MainScreen() {
                 }
             }
 
-            // 🎯 2. ПАНЕЛ ЗА ИЗБРАН ОБЕКТ С БУТОН ЗА НАВИГАЦИЯ
             if (selectedTargetGeoPoint != null && !isGuidanceActive) {
                 Surface(
                     modifier = Modifier
@@ -1045,7 +1058,11 @@ fun MainScreen() {
                                 modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(14.dp)
                             ) {
-                                Text(if (currentLanguage == AppLanguage.BG) "Вградена\nНавигация" else "Built-in\nGuidance", fontSize = 13.sp)
+                                Text(
+                                    text = if (currentLanguage == AppLanguage.BG) "Вградена\nНавигация" else "Built-in\nGuidance",
+                                    fontSize = 13.sp,
+                                    textAlign = TextAlign.Center
+                                )
                             }
 
                             OutlinedButton(
@@ -1057,14 +1074,17 @@ fun MainScreen() {
                                 modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(14.dp)
                             ) {
-                                Text("Google Maps \nWaze", fontSize = 13.sp)
+                                Text(
+                                    text = "Google Maps\nWaze",
+                                    fontSize = 13.sp,
+                                    textAlign = TextAlign.Center
+                                )
                             }
                         }
                     }
                 }
             }
 
-            // 🎛️ 3. ДОЛНА КОНТРОЛНА ЛЕНТА
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -1074,7 +1094,6 @@ fun MainScreen() {
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // БУТОН ЗА СМЯНА НА ЕЗИК
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -1094,7 +1113,6 @@ fun MainScreen() {
                     }
                 }
 
-                // БУТОН ЗА ТЕМА
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -1113,7 +1131,6 @@ fun MainScreen() {
                     }
                 }
 
-                // СЛАЙДЕР ЗА РАДИУС
                 Surface(
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(18.dp),
@@ -1145,7 +1162,6 @@ fun MainScreen() {
                     }
                 }
 
-                // БУТОН ЗА ОПРЕСНЯВАНЕ
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -1174,7 +1190,6 @@ fun MainScreen() {
                     }
                 }
 
-                // БУТОН ЗА ТЕКУЩА ПОЗИЦИЯ
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -1203,7 +1218,6 @@ fun MainScreen() {
                 }
             }
 
-            // ДИАЛОГ "ABOUT"
             if (showAboutDialog) {
                 val scrollState = rememberScrollState()
 
@@ -1256,8 +1270,9 @@ fun MainScreen() {
                                     • Паметници
 
                                     🌟 Възможности:
+                                    • Turn-by-Turn навигация със стрелки и метраж до завоите.
+                                    • Автомащабиране (Auto-Zoom) на картата спрямо скоростта на движение.
                                     • Затъмняване на иконката на избрания обект.
-                                    • GPS & Компас Guidance Навигация по улиците с OSRM маршрутизиране.
                                     • Динамичен компас и ориентация на картата спрямо устройството.
                                     • Регулиране на радиуса на търсене от 1.0 до 5.0 км.
                                     • Дневна и Нощна тема с автоматична промяна на картата.
@@ -1289,8 +1304,9 @@ fun MainScreen() {
                                     • Monuments
 
                                     🌟 Features:
+                                    • Turn-by-Turn navigation with turn arrows and distance metrics.
+                                    • Speed-based Auto-Zoom map scaling.
                                     • Darkened icon visual indication for selected spots.
-                                    • Built-in GPS & Compass Guidance with OSRM street-level routing.
                                     • Dynamic compass and real-time device map orientation.
                                     • Search radius adjustment from 1.0 to 5.0 km.
                                     • Day / Night mode with automatic map contrast adjustment.
