@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -19,6 +20,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.location.Location
 import android.location.LocationManager
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
@@ -55,6 +57,7 @@ import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polygon
+import org.osmdroid.views.overlay.Polyline
 import org.osmdroid.views.overlay.mylocation.GpsMyLocationProvider
 import org.osmdroid.views.overlay.mylocation.MyLocationNewOverlay
 import retrofit2.Retrofit
@@ -176,7 +179,7 @@ interface OverpassApi {
                 .readTimeout(10, TimeUnit.SECONDS)
                 .addInterceptor { chain ->
                     val request = chain.request().newBuilder()
-                        .header("User-Agent", "OasisUrban-CitySpotMap/3.5 (Android)")
+                        .header("User-Agent", "OasisUrban-CitySpotMap/3.6 (Android)")
                         .build()
                     chain.proceed(request)
                 }
@@ -194,28 +197,49 @@ interface OverpassApi {
 
 // --- 2. Помощни функции ---
 
-private fun createEmojiMarkerIcon(context: Context, emoji: String, backgroundColorHex: String): Drawable {
+/**
+ * Създава иконка за маркер.
+ * Ако [isSelected] е true, иконката става ПО-ТЪМНА с удебелен жълт контур.
+ */
+private fun createEmojiMarkerIcon(
+    context: Context,
+    emoji: String,
+    backgroundColorHex: String,
+    isSelected: Boolean = false
+): Drawable {
     val density = context.resources.displayMetrics.density
-    val sizePx = (42 * density).toInt()
+    val sizePx = ((if (isSelected) 46 else 40) * density).toInt()
     val bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
     val canvas = Canvas(bitmap)
 
-    val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor(backgroundColorHex)
-        style = Paint.Style.FILL
-    }
-    val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        style = Paint.Style.STROKE
-        strokeWidth = 2.5f * density
+    val baseColor = Color.parseColor(backgroundColorHex)
+    val colorToUse = if (isSelected) {
+        // Затъмняваме цвета с 55% при избор
+        val hsv = FloatArray(3)
+        Color.colorToHSV(baseColor, hsv)
+        hsv[2] *= 0.45f
+        Color.HSVToColor(hsv)
+    } else {
+        baseColor
     }
 
-    val radius = (sizePx / 2f) - (2 * density)
+    val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = colorToUse
+        style = Paint.Style.FILL
+    }
+
+    val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = if (isSelected) Color.YELLOW else Color.WHITE
+        style = Paint.Style.STROKE
+        strokeWidth = (if (isSelected) 3.5f else 2.5f) * density
+    }
+
+    val radius = (sizePx / 2f) - (3 * density)
     canvas.drawCircle(sizePx / 2f, sizePx / 2f, radius, bgPaint)
     canvas.drawCircle(sizePx / 2f, sizePx / 2f, radius, strokePaint)
 
     val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        textSize = 20f * density
+        textSize = (if (isSelected) 22f else 19f) * density
         textAlign = Paint.Align.CENTER
     }
     val textY = (sizePx / 2f) - ((textPaint.descent() + textPaint.ascent()) / 2f)
@@ -284,13 +308,85 @@ private fun buildUnifiedOverpassQuery(lat: Double, lon: Double, radiusMeters: In
     """.trimIndent()
 }
 
+/**
+ * Пресмята разстоянието и посоката (стрелка) спрямо текущия азимут на компаса.
+ */
+private fun calculateGuidanceInfo(
+    userPoint: GeoPoint?,
+    targetPoint: GeoPoint?,
+    azimuth: Float,
+    lang: AppLanguage
+): Pair<String, String> {
+    if (userPoint == null || targetPoint == null) {
+        return Pair("--", "❓")
+    }
+
+    val userLoc = Location("").apply {
+        latitude = userPoint.latitude
+        longitude = userPoint.longitude
+    }
+    val targetLoc = Location("").apply {
+        latitude = targetPoint.latitude
+        longitude = targetPoint.longitude
+    }
+
+    val distMeters = userLoc.distanceTo(targetLoc)
+    val distStr = if (distMeters >= 1000) {
+        String.format("%.2f km", distMeters / 1000f)
+    } else {
+        "${distMeters.toInt()} m"
+    }
+
+    val bearing = userLoc.bearingTo(targetLoc) // -180..180
+    val relAngle = (bearing - azimuth + 360) % 360
+
+    val arrow = when (relAngle) {
+        in 337.5..360.0, in 0.0..22.5 -> "⬆️"
+        in 22.5..67.5 -> "↗️"
+        in 67.5..112.5 -> "➡️"
+        in 112.5..157.5 -> "↘️"
+        in 157.5..202.5 -> "⬇️"
+        in 202.5..247.5 -> "↙️"
+        in 247.5..292.5 -> "⬅️"
+        in 292.5..337.5 -> "↖️"
+        else -> "⬆️"
+    }
+
+    val dirText = when (relAngle) {
+        in 337.5..360.0, in 0.0..22.5 -> if (lang == AppLanguage.BG) "Право напред" else "Straight Ahead"
+        in 22.5..67.5 -> if (lang == AppLanguage.BG) "Вдясно пред теб" else "Slight Right"
+        in 67.5..112.5 -> if (lang == AppLanguage.BG) "Надясно" else "Turn Right"
+        in 112.5..157.5 -> if (lang == AppLanguage.BG) "Вдясно зад теб" else "Hard Right"
+        in 157.5..202.5 -> if (lang == AppLanguage.BG) "Зад теб" else "Behind You"
+        in 202.5..247.5 -> if (lang == AppLanguage.BG) "Вляво зад теб" else "Hard Left"
+        in 247.5..292.5 -> if (lang == AppLanguage.BG) "Наляво" else "Turn Left"
+        in 292.5..337.5 -> if (lang == AppLanguage.BG) "Вляво пред теб" else "Slight Left"
+        else -> ""
+    }
+
+    return Pair(distStr, "$arrow $dirText")
+}
+
+private fun openGoogleMaps(context: Context, target: GeoPoint, label: String) {
+    val uri = Uri.parse("google.navigation:q=${target.latitude},${target.longitude}")
+    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+        setPackage("com.google.android.apps.maps")
+    }
+    if (intent.resolveActivity(context.packageManager) != null) {
+        context.startActivity(intent)
+    } else {
+        val genericUri = Uri.parse("geo:${target.latitude},${target.longitude}?q=${target.latitude},${target.longitude}($label)")
+        val genericIntent = Intent(Intent.ACTION_VIEW, genericUri)
+        context.startActivity(genericIntent)
+    }
+}
+
 // --- 3. Главен Activity ---
 
 class MainActivity : ComponentActivity() {
     @SuppressLint("SourceLockedOrientationActivity")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // 🔒 Заключване в Portrait режим
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         enableEdgeToEdge()
         Configuration.getInstance().userAgentValue = packageName
@@ -308,9 +404,7 @@ fun MainScreen() {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("OasisUrbanPrefs", Context.MODE_PRIVATE) }
 
-    var isDarkMode by remember {
-        mutableStateOf(prefs.getBoolean("is_dark_mode", false))
-    }
+    var isDarkMode by remember { mutableStateOf(prefs.getBoolean("is_dark_mode", false)) }
 
     MaterialTheme(
         colorScheme = if (isDarkMode) darkColorScheme() else lightColorScheme()
@@ -336,6 +430,15 @@ fun MainScreen() {
 
         var searchCenterGeoPoint by remember { mutableStateOf(GeoPoint(42.6977, 23.3219)) }
 
+        // --- Състояния за Избран Маркер & Guidance Навигация ---
+        var currentlySelectedMarker by remember { mutableStateOf<Marker?>(null) }
+        var selectedTargetGeoPoint by remember { mutableStateOf<GeoPoint?>(null) }
+        var selectedTargetTitle by remember { mutableStateOf<String?>(null) }
+        var selectedTargetDetails by remember { mutableStateOf<String?>(null) }
+
+        var isGuidanceActive by remember { mutableStateOf(false) }
+        var currentAzimuth by remember { mutableFloatStateOf(0f) }
+
         fun updateSearchCenterIfMoved(newPoint: GeoPoint) {
             if (searchCenterGeoPoint.distanceToAsDouble(newPoint) > 50.0) {
                 searchCenterGeoPoint = newPoint
@@ -346,9 +449,28 @@ fun MainScreen() {
             PoiCategory.entries.filter { it.mainCategory == selectedMainCategory }
         }
 
+        fun deselectCurrentMarker() {
+            currentlySelectedMarker?.let { prevMarker ->
+                val prevCat = (prevMarker.relatedObject as? PoiCategory)
+                if (prevCat != null) {
+                    prevMarker.icon = createEmojiMarkerIcon(context, prevCat.icon, prevCat.colorHex, isSelected = false)
+                }
+                prevMarker.closeInfoWindow()
+            }
+            currentlySelectedMarker = null
+            selectedTargetGeoPoint = null
+            selectedTargetTitle = null
+            selectedTargetDetails = null
+        }
+
         val mapEventsOverlay = remember {
             MapEventsOverlay(object : MapEventsReceiver {
-                override fun singleTapConfirmedHelper(p: GeoPoint): Boolean = false
+                override fun singleTapConfirmedHelper(p: GeoPoint): Boolean {
+                    if (!isGuidanceActive) {
+                        deselectCurrentMarker()
+                    }
+                    return false
+                }
 
                 override fun longPressHelper(p: GeoPoint): Boolean {
                     searchCenterGeoPoint = p
@@ -366,7 +488,15 @@ fun MainScreen() {
             }
         }
 
-        // 🧭 СИСТЕМЕН СЕНЗОР ЗА ВЪРТЕНЕ НА КАРТАТА С SENSORMANAGER
+        // Линия за навигация (Polyline)
+        val navigationPolyline = remember {
+            Polyline().apply {
+                outlinePaint.color = Color.parseColor("#0288D1")
+                outlinePaint.strokeWidth = 14f
+            }
+        }
+
+        // 🧭 СЕНЗОР ЗА ВЪРТЕНЕ (SENSORMANAGER) & ЖИВО ОБНОВЯВАНЕ НА АЗИМУТА
         val sensorManager = remember { context.getSystemService(Context.SENSOR_SERVICE) as SensorManager }
         val rotationSensor = remember { sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR) }
 
@@ -385,16 +515,15 @@ fun MainScreen() {
                             val orientation = FloatArray(3)
                             SensorManager.getOrientation(rotationMatrix, orientation)
 
-                            // Превръщаме в градуси 0 - 360
                             var azimuth = Math.toDegrees(orientation[0].toDouble()).toFloat()
                             if (azimuth < 0) azimuth += 360f
 
-                            // Опресняваме само при промяна над 1.5 градуса
                             if (abs(azimuth - lastAzimuth) > 1.5f) {
                                 lastAzimuth = azimuth
+                                currentAzimuth = azimuth
                                 mapView.post {
                                     mapView.mapOrientation = -azimuth
-                                    mapView.invalidate() // ⚡ Задължително за да се преначертае картата!
+                                    mapView.invalidate()
                                 }
                             }
                         }
@@ -441,6 +570,27 @@ fun MainScreen() {
             }
         }
 
+        // Обновяване на линията за навигация спрямо GPS позицията
+        LaunchedEffect(isGuidanceActive, selectedTargetGeoPoint, myLocationOverlay.myLocation, currentAzimuth) {
+            if (isGuidanceActive && selectedTargetGeoPoint != null) {
+                val myLoc = myLocationOverlay.myLocation
+                val userPoint = if (myLoc != null) GeoPoint(myLoc.latitude, myLoc.longitude) else getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
+
+                if (userPoint != null) {
+                    navigationPolyline.setPoints(listOf(userPoint, selectedTargetGeoPoint))
+                    if (!mapView.overlays.contains(navigationPolyline)) {
+                        mapView.overlays.add(navigationPolyline)
+                    }
+                    mapView.invalidate()
+                }
+            } else {
+                if (mapView.overlays.contains(navigationPolyline)) {
+                    mapView.overlays.remove(navigationPolyline)
+                    mapView.invalidate()
+                }
+            }
+        }
+
         LaunchedEffect(myLocationOverlay) {
             myLocationOverlay.runOnFirstFix {
                 val loc = myLocationOverlay.myLocation
@@ -461,7 +611,8 @@ fun MainScreen() {
 
         fun renderCategoryElements(allElements: List<Element>, category: PoiCategory, lang: AppLanguage) {
             val filtered = allElements.filter { it.belongsToCategory(category) }
-            val poiIcon = createEmojiMarkerIcon(context, category.icon, category.colorHex)
+            val normalPoiIcon = createEmojiMarkerIcon(context, category.icon, category.colorHex, isSelected = false)
+            val selectedPoiIcon = createEmojiMarkerIcon(context, category.icon, category.colorHex, isSelected = true)
 
             filtered.forEach { element ->
                 val lat = element.actualLat
@@ -471,9 +622,33 @@ fun MainScreen() {
                         position = GeoPoint(lat, lon)
                         title = element.getLocalizedTitle(category, lang)
                         snippet = formatSpotDetails(category, element.tags, lang)
-                        icon = poiIcon
+                        icon = normalPoiIcon
+                        relatedObject = category
                         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                     }
+
+                    // КЛИК ВЪРХУ МАРКЕР -> ТЪМНА ИКОНКА И ИНФОРМАЦИЯ
+                    marker.setOnMarkerClickListener { m, _ ->
+                        // 1. Връщаме предишния избран маркер в нормално състояние
+                        currentlySelectedMarker?.let { prevMarker ->
+                            val prevCat = (prevMarker.relatedObject as? PoiCategory) ?: category
+                            prevMarker.icon = createEmojiMarkerIcon(context, prevCat.icon, prevCat.colorHex, isSelected = false)
+                        }
+
+                        // 2. Оцветяваме новия маркер в ПО-ТЪМЕН цвят
+                        m.icon = selectedPoiIcon
+                        currentlySelectedMarker = m
+
+                        m.showInfoWindow()
+
+                        // 3. Запазваме данните за навигационната лента
+                        selectedTargetGeoPoint = m.position
+                        selectedTargetTitle = m.title
+                        selectedTargetDetails = m.snippet
+
+                        true
+                    }
+
                     mapView.overlays.add(marker)
                 }
             }
@@ -491,6 +666,9 @@ fun MainScreen() {
 
         fun loadOrFilterData(category: PoiCategory, center: GeoPoint, radius: Float, lang: AppLanguage, forceReload: Boolean = false) {
             activeJob?.cancel()
+
+            deselectCurrentMarker()
+            isGuidanceActive = false
 
             mapView.overlays.clear()
             mapView.overlays.add(mapEventsOverlay)
@@ -569,7 +747,7 @@ fun MainScreen() {
                     renderCategoryElements(finalResponse.elements, category, lang)
 
                 } catch (e: CancellationException) {
-                    // Игнориране при отменена корутина
+                    // Игнориране при отмяна
                 } catch (e: Exception) {
                     Log.e("OasisUrban", "Грешка при зареждане", e)
                     val errPrefix = if (lang == AppLanguage.BG) "Мрежова грешка: " else "Network error: "
@@ -614,104 +792,241 @@ fun MainScreen() {
                 modifier = Modifier.fillMaxSize()
             )
 
-            // ГОРНО МЕНЮ С КАТЕГОРИИ
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .statusBarsPadding()
-                    .padding(top = 8.dp)
-            ) {
+            // 🧭 1. GUIDANCE HUD ТОР ПАНЕЛ (Показва се когато навигацията е активна)
+            if (isGuidanceActive && selectedTargetGeoPoint != null) {
+                val userPoint = myLocationOverlay.myLocation?.let { GeoPoint(it.latitude, it.longitude) }
+                    ?: getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
+
+                val (distText, dirText) = calculateGuidanceInfo(userPoint, selectedTargetGeoPoint, currentAzimuth, currentLanguage)
+
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 12.dp),
-                    shape = RoundedCornerShape(20.dp),
-                    shadowElevation = 8.dp,
-                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                        .statusBarsPadding()
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    shape = RoundedCornerShape(24.dp),
+                    shadowElevation = 10.dp,
+                    color = MaterialTheme.colorScheme.primaryContainer
                 ) {
-                    Column(modifier = Modifier.padding(vertical = 6.dp)) {
-
+                    Row(
+                        modifier = Modifier.padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
                         ) {
-                            LazyRow(
-                                modifier = Modifier.weight(1f).padding(start = 8.dp),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            Text(
+                                text = dirText.takeWhile { !it.isWhitespace() },
+                                fontSize = 34.sp,
+                                modifier = Modifier.padding(end = 10.dp)
+                            )
+                            Column {
+                                Text(
+                                    text = selectedTargetTitle ?: "",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 15.sp,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    maxLines = 1
+                                )
+                                Text(
+                                    text = "$distText • ${dirText.dropWhile { !it.isWhitespace() }.trim()}",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
+                                )
+                            }
+                        }
+
+                        Button(
+                            onClick = { isGuidanceActive = false },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                            shape = RoundedCornerShape(16.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text(if (currentLanguage == AppLanguage.BG) "Спри" else "Stop", fontSize = 12.sp)
+                        }
+                    }
+                }
+            } else {
+                // ГОРНО МЕНЮ С КАТЕГОРИИ (Когато няма активна навигация)
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .statusBarsPadding()
+                        .padding(top = 8.dp)
+                ) {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp),
+                        shape = RoundedCornerShape(20.dp),
+                        shadowElevation = 8.dp,
+                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                    ) {
+                        Column(modifier = Modifier.padding(vertical = 6.dp)) {
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                items(MainCategory.entries) { mainCat ->
-                                    FilterChip(
-                                        selected = selectedMainCategory == mainCat,
-                                        onClick = {
-                                            selectedMainCategory = mainCat
-                                            val firstSub = PoiCategory.entries.firstOrNull { it.mainCategory == mainCat }
-                                            if (firstSub != null) {
-                                                selectedPoiCategory = firstSub
+                                LazyRow(
+                                    modifier = Modifier.weight(1f).padding(start = 8.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    items(MainCategory.entries) { mainCat ->
+                                        FilterChip(
+                                            selected = selectedMainCategory == mainCat,
+                                            onClick = {
+                                                selectedMainCategory = mainCat
+                                                val firstSub = PoiCategory.entries.firstOrNull { it.mainCategory == mainCat }
+                                                if (firstSub != null) {
+                                                    selectedPoiCategory = firstSub
+                                                }
+                                            },
+                                            label = { Text("${mainCat.icon} ${mainCat.label(currentLanguage)}", fontSize = 13.sp) }
+                                        )
+                                    }
+                                }
+
+                                Box(modifier = Modifier.padding(end = 4.dp)) {
+                                    IconButton(onClick = { showMenu = true }) {
+                                        Text("⋮", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                                    }
+
+                                    DropdownMenu(
+                                        expanded = showMenu,
+                                        onDismissRequest = { showMenu = false }
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = { Text(if (currentLanguage == AppLanguage.BG) "За приложението" else "About") },
+                                            onClick = {
+                                                showMenu = false
+                                                showAboutDialog = true
                                             }
-                                        },
-                                        label = { Text("${mainCat.icon} ${mainCat.label(currentLanguage)}", fontSize = 13.sp) }
-                                    )
+                                        )
+                                        HorizontalDivider()
+                                        DropdownMenuItem(
+                                            text = { Text(if (currentLanguage == AppLanguage.BG) "Изход" else "Exit") },
+                                            onClick = {
+                                                showMenu = false
+                                                (context as? Activity)?.finish()
+                                            }
+                                        )
+                                    }
                                 }
                             }
 
-                            Box(modifier = Modifier.padding(end = 4.dp)) {
-                                IconButton(onClick = { showMenu = true }) {
-                                    Text("⋮", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                                }
+                            HorizontalDivider(
+                                modifier = Modifier.padding(vertical = 4.dp, horizontal = 12.dp),
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                            )
 
-                                DropdownMenu(
-                                    expanded = showMenu,
-                                    onDismissRequest = { showMenu = false }
-                                ) {
-                                    DropdownMenuItem(
-                                        text = { Text(if (currentLanguage == AppLanguage.BG) "За приложението" else "About") },
-                                        onClick = {
-                                            showMenu = false
-                                            showAboutDialog = true
-                                        }
-                                    )
-                                    HorizontalDivider()
-                                    DropdownMenuItem(
-                                        text = { Text(if (currentLanguage == AppLanguage.BG) "Изход" else "Exit") },
-                                        onClick = {
-                                            showMenu = false
-                                            (context as? Activity)?.finish()
-                                        }
+                            LazyRow(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                items(currentSubCategories) { poi ->
+                                    FilterChip(
+                                        selected = selectedPoiCategory == poi,
+                                        onClick = { selectedPoiCategory = poi },
+                                        label = { Text("${poi.icon} ${poi.label(currentLanguage)}", fontSize = 12.sp) }
                                     )
                                 }
                             }
                         }
+                    }
 
-                        HorizontalDivider(
-                            modifier = Modifier.padding(vertical = 4.dp, horizontal = 12.dp),
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                    if (isLoading) {
+                        LinearProgressIndicator(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 24.dp, vertical = 6.dp)
                         )
+                    }
+                }
+            }
 
-                        LazyRow(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            // 🎯 2. ПАНЕЛ ЗА ИЗБРАН ОБЕКТ С БУТОН ЗА НАВИГАЦИЯ (Долу над лентата)
+            if (selectedTargetGeoPoint != null && !isGuidanceActive) {
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .navigationBarsPadding()
+                        .padding(bottom = 82.dp, start = 12.dp, end = 12.dp)
+                        .fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    shadowElevation = 10.dp,
+                    color = MaterialTheme.colorScheme.surface
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            items(currentSubCategories) { poi ->
-                                FilterChip(
-                                    selected = selectedPoiCategory == poi,
-                                    onClick = { selectedPoiCategory = poi },
-                                    label = { Text("${poi.icon} ${poi.label(currentLanguage)}", fontSize = 12.sp) }
-                                )
+                            Text(
+                                text = selectedTargetTitle ?: "",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp,
+                                modifier = Modifier.weight(1f)
+                            )
+                            IconButton(
+                                onClick = { deselectCurrentMarker() },
+                                modifier = Modifier.size(26.dp)
+                            ) {
+                                Text("✕", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        if (!selectedTargetDetails.isNullOrBlank()) {
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = selectedTargetDetails ?: "",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f),
+                                maxLines = 3
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = {
+                                    isGuidanceActive = true
+                                    val myLoc = myLocationOverlay.myLocation
+                                    if (myLoc != null) {
+                                        mapView.controller.animateTo(GeoPoint(myLoc.latitude, myLoc.longitude))
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(14.dp)
+                            ) {
+                                Text(if (currentLanguage == AppLanguage.BG) "🧭 Навигация" else "🧭 Guidance", fontSize = 13.sp)
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    selectedTargetGeoPoint?.let { pt ->
+                                        openGoogleMaps(context, pt, selectedTargetTitle ?: "Target")
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(14.dp)
+                            ) {
+                                Text("🗺️ Maps", fontSize = 13.sp)
                             }
                         }
                     }
                 }
-
-                if (isLoading) {
-                    LinearProgressIndicator(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 24.dp, vertical = 6.dp)
-                    )
-                }
             }
 
-            // ДОЛНА КОНТРОЛНА ЛЕНТА
+            // 🎛️ 3. ДОЛНА КОНТРОЛНА ЛЕНТА
             Row(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -721,7 +1036,7 @@ fun MainScreen() {
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // 1. БУТОН ЗА СМЯНА НА ЕЗИК
+                // БУТОН ЗА СМЯНА НА ЕЗИК
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -741,7 +1056,7 @@ fun MainScreen() {
                     }
                 }
 
-                // 2. БУТОН ЗА ТЕМА (ДНЕВНА / НОЩНА)
+                // БУТОН ЗА ТЕМА (ДНЕВНА / НОЩНА)
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -760,7 +1075,7 @@ fun MainScreen() {
                     }
                 }
 
-                // 3. СЛАЙДЕР ЗА РАДИУС
+                // СЛАЙДЕР ЗА РАДИУС
                 Surface(
                     modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(18.dp),
@@ -792,7 +1107,7 @@ fun MainScreen() {
                     }
                 }
 
-                // 4. БУТОН ЗА ОПРЕСНЯВАНЕ
+                // БУТОН ЗА ОПРЕСНЯВАНЕ
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -821,7 +1136,7 @@ fun MainScreen() {
                     }
                 }
 
-                // 5. БУТОН ЗА ТЕКУЩА ПОЗИЦИЯ (GPS)
+                // БУТОН ЗА ТЕКУЩА ПОЗИЦИЯ (GPS)
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -903,10 +1218,12 @@ fun MainScreen() {
                                     • Паметници
 
                                     🌟 Възможности:
+                                    • Затъмняване на иконката на избрания обект.
+                                    • GPS & Компас Guidance Навигация с визуална линия и стрелка на посоката.
                                     • Динамичен компас и ориентация на картата спрямо устройството.
                                     • Регулиране на радиуса на търсене от 1.0 до 5.0 км.
                                     • Дневна и Нощна тема с автоматична промяна на картата.
-                                    • Сканиране на произволна точка с продължително натискане (Long Press) върху картата.
+                                    • Сканиране на произволна точка с продължително натискане (Long Press).
                                     • Поддръжка на български и английски език.
                                     """.trimIndent()
                                 } else {
@@ -934,6 +1251,8 @@ fun MainScreen() {
                                     • Monuments
 
                                     🌟 Features:
+                                    • Darkened icon visual indication for selected spots.
+                                    • Built-in GPS & Compass Guidance with direct line overlay and live orientation arrow.
                                     • Dynamic compass and real-time device map orientation.
                                     • Search radius adjustment from 1.0 to 5.0 km.
                                     • Day / Night mode with automatic map contrast adjustment.
