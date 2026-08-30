@@ -44,11 +44,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.google.gson.Gson
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapEventsReceiver
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
@@ -109,6 +113,11 @@ data class CachedAreaResult(
     val radiusKm: Float,
     val elements: List<Element>
 )
+
+// --- OSRM Модели за улично рутиране ---
+data class OsrmResponse(val routes: List<OsrmRoute>?)
+data class OsrmRoute(val geometry: OsrmGeometry?)
+data class OsrmGeometry(val coordinates: List<List<Double>>?)
 
 enum class MainCategory(
     val labelBg: String,
@@ -198,6 +207,30 @@ interface OverpassApi {
 // --- 2. Помощни функции ---
 
 /**
+ * Извлича маршрут по улиците от OSRM (Open Source Routing Machine) API.
+ */
+suspend fun fetchStreetRoute(start: GeoPoint, target: GeoPoint): List<GeoPoint> = withContext(Dispatchers.IO) {
+    try {
+        val url = "https://router.project-osrm.org/route/v1/foot/" +
+                "${start.longitude},${start.latitude};${target.longitude},${target.latitude}" +
+                "?overview=full&geometries=geojson"
+
+        val client = OkHttpClient()
+        val request = Request.Builder().url(url).build()
+        val response = client.newCall(request).execute()
+        val json = response.body?.string() ?: return@withContext listOf(start, target)
+
+        val osrmResponse = Gson().fromJson(json, OsrmResponse::class.java)
+        val coords = osrmResponse.routes?.firstOrNull()?.geometry?.coordinates ?: return@withContext listOf(start, target)
+
+        coords.map { GeoPoint(it[1], it[0]) }
+    } catch (e: Exception) {
+        Log.e("OasisUrban", "Грешка при извличане на маршрут", e)
+        listOf(start, target)
+    }
+}
+
+/**
  * Създава иконка за маркер.
  * Ако [isSelected] е true, иконката става ПО-ТЪМНА с удебелен жълт контур.
  */
@@ -214,7 +247,6 @@ private fun createEmojiMarkerIcon(
 
     val baseColor = Color.parseColor(backgroundColorHex)
     val colorToUse = if (isSelected) {
-        // Затъмняваме цвета с 55% при избор
         val hsv = FloatArray(3)
         Color.colorToHSV(baseColor, hsv)
         hsv[2] *= 0.45f
@@ -337,7 +369,7 @@ private fun calculateGuidanceInfo(
         "${distMeters.toInt()} m"
     }
 
-    val bearing = userLoc.bearingTo(targetLoc) // -180..180
+    val bearing = userLoc.bearingTo(targetLoc)
     val relAngle = (bearing - azimuth + 360) % 360
 
     val arrow = when (relAngle) {
@@ -430,7 +462,7 @@ fun MainScreen() {
 
         var searchCenterGeoPoint by remember { mutableStateOf(GeoPoint(42.6977, 23.3219)) }
 
-        // --- Състояния за Избран Маркер & Guidance Навигация ---
+        // --- Състояния за Избран Маркер, Route & Guidance Навигация ---
         var currentlySelectedMarker by remember { mutableStateOf<Marker?>(null) }
         var selectedTargetGeoPoint by remember { mutableStateOf<GeoPoint?>(null) }
         var selectedTargetTitle by remember { mutableStateOf<String?>(null) }
@@ -438,6 +470,7 @@ fun MainScreen() {
 
         var isGuidanceActive by remember { mutableStateOf(false) }
         var currentAzimuth by remember { mutableFloatStateOf(0f) }
+        var routePoints by remember { mutableStateOf<List<GeoPoint>>(emptyList()) }
 
         fun updateSearchCenterIfMoved(newPoint: GeoPoint) {
             if (searchCenterGeoPoint.distanceToAsDouble(newPoint) > 50.0) {
@@ -496,7 +529,7 @@ fun MainScreen() {
             }
         }
 
-        // 🧭 СЕНЗОР ЗА ВЪРТЕНЕ (SENSORMANAGER) & ЖИВО ОБНОВЯВАНЕ НА АЗИМУТА
+        // 🧭 СЕНЗОР ЗА ВЪРТЕНЕ & ЖИВО ОБНОВЯВАНЕ НА АЗИМУТА
         val sensorManager = remember { context.getSystemService(Context.SENSOR_SERVICE) as SensorManager }
         val rotationSensor = remember { sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR) }
 
@@ -570,25 +603,34 @@ fun MainScreen() {
             }
         }
 
-        // Обновяване на линията за навигация спрямо GPS позицията
-        LaunchedEffect(isGuidanceActive, selectedTargetGeoPoint, myLocationOverlay.myLocation, currentAzimuth) {
+        // 🛣️ 1. Извличане на уличния маршрут през OSRM API
+        LaunchedEffect(isGuidanceActive, selectedTargetGeoPoint) {
             if (isGuidanceActive && selectedTargetGeoPoint != null) {
                 val myLoc = myLocationOverlay.myLocation
-                val userPoint = if (myLoc != null) GeoPoint(myLoc.latitude, myLoc.longitude) else getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
+                val userPoint = if (myLoc != null) GeoPoint(myLoc.latitude, myLoc.longitude)
+                else getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
 
                 if (userPoint != null) {
-                    navigationPolyline.setPoints(listOf(userPoint, selectedTargetGeoPoint))
-                    if (!mapView.overlays.contains(navigationPolyline)) {
-                        mapView.overlays.add(navigationPolyline)
-                    }
-                    mapView.invalidate()
+                    routePoints = fetchStreetRoute(userPoint, selectedTargetGeoPoint!!)
+                }
+            } else {
+                routePoints = emptyList()
+            }
+        }
+
+        // 🛣️ 2. Визуализиране на уличния Polyline върху картата
+        LaunchedEffect(routePoints) {
+            if (routePoints.isNotEmpty()) {
+                navigationPolyline.setPoints(routePoints)
+                if (!mapView.overlays.contains(navigationPolyline)) {
+                    mapView.overlays.add(navigationPolyline)
                 }
             } else {
                 if (mapView.overlays.contains(navigationPolyline)) {
                     mapView.overlays.remove(navigationPolyline)
-                    mapView.invalidate()
                 }
             }
+            mapView.invalidate()
         }
 
         LaunchedEffect(myLocationOverlay) {
@@ -627,21 +669,17 @@ fun MainScreen() {
                         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                     }
 
-                    // КЛИК ВЪРХУ МАРКЕР -> ТЪМНА ИКОНКА И ИНФОРМАЦИЯ
                     marker.setOnMarkerClickListener { m, _ ->
-                        // 1. Връщаме предишния избран маркер в нормално състояние
                         currentlySelectedMarker?.let { prevMarker ->
                             val prevCat = (prevMarker.relatedObject as? PoiCategory) ?: category
                             prevMarker.icon = createEmojiMarkerIcon(context, prevCat.icon, prevCat.colorHex, isSelected = false)
                         }
 
-                        // 2. Оцветяваме новия маркер в ПО-ТЪМЕН цвят
                         m.icon = selectedPoiIcon
                         currentlySelectedMarker = m
 
                         m.showInfoWindow()
 
-                        // 3. Запазваме данните за навигационната лента
                         selectedTargetGeoPoint = m.position
                         selectedTargetTitle = m.title
                         selectedTargetDetails = m.snippet
@@ -792,7 +830,7 @@ fun MainScreen() {
                 modifier = Modifier.fillMaxSize()
             )
 
-            // 🧭 1. GUIDANCE HUD ТОР ПАНЕЛ (Показва се когато навигацията е активна)
+            // 🧭 1. GUIDANCE HUD ТОР ПАНЕЛ
             if (isGuidanceActive && selectedTargetGeoPoint != null) {
                 val userPoint = myLocationOverlay.myLocation?.let { GeoPoint(it.latitude, it.longitude) }
                     ?: getUserLocation(context)?.let { GeoPoint(it.latitude, it.longitude) }
@@ -850,7 +888,7 @@ fun MainScreen() {
                     }
                 }
             } else {
-                // ГОРНО МЕНЮ С КАТЕГОРИИ (Когато няма активна навигация)
+                // ГОРНО МЕНЮ С КАТЕГОРИИ
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -948,7 +986,7 @@ fun MainScreen() {
                 }
             }
 
-            // 🎯 2. ПАНЕЛ ЗА ИЗБРАН ОБЕКТ С БУТОН ЗА НАВИГАЦИЯ (Долу над лентата)
+            // 🎯 2. ПАНЕЛ ЗА ИЗБРАН ОБЕКТ С БУТОН ЗА НАВИГАЦИЯ
             if (selectedTargetGeoPoint != null && !isGuidanceActive) {
                 Surface(
                     modifier = Modifier
@@ -1007,7 +1045,7 @@ fun MainScreen() {
                                 modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(14.dp)
                             ) {
-                                Text(if (currentLanguage == AppLanguage.BG) "🧭 Навигация" else "🧭 Guidance", fontSize = 13.sp)
+                                Text(if (currentLanguage == AppLanguage.BG) "Вградена\nНавигация" else "Built-in\nGuidance", fontSize = 13.sp)
                             }
 
                             OutlinedButton(
@@ -1019,7 +1057,7 @@ fun MainScreen() {
                                 modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(14.dp)
                             ) {
-                                Text("🗺️ Maps", fontSize = 13.sp)
+                                Text("Google Maps \nWaze", fontSize = 13.sp)
                             }
                         }
                     }
@@ -1056,7 +1094,7 @@ fun MainScreen() {
                     }
                 }
 
-                // БУТОН ЗА ТЕМА (ДНЕВНА / НОЩНА)
+                // БУТОН ЗА ТЕМА
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -1136,7 +1174,7 @@ fun MainScreen() {
                     }
                 }
 
-                // БУТОН ЗА ТЕКУЩА ПОЗИЦИЯ (GPS)
+                // БУТОН ЗА ТЕКУЩА ПОЗИЦИЯ
                 Surface(
                     shape = RoundedCornerShape(18.dp),
                     shadowElevation = 8.dp,
@@ -1165,7 +1203,7 @@ fun MainScreen() {
                 }
             }
 
-            // ДИАЛОГ "ABOUT" С ВЕРТИКАЛЕН СКРОЛ
+            // ДИАЛОГ "ABOUT"
             if (showAboutDialog) {
                 val scrollState = rememberScrollState()
 
@@ -1219,7 +1257,7 @@ fun MainScreen() {
 
                                     🌟 Възможности:
                                     • Затъмняване на иконката на избрания обект.
-                                    • GPS & Компас Guidance Навигация с визуална линия и стрелка на посоката.
+                                    • GPS & Компас Guidance Навигация по улиците с OSRM маршрутизиране.
                                     • Динамичен компас и ориентация на картата спрямо устройството.
                                     • Регулиране на радиуса на търсене от 1.0 до 5.0 км.
                                     • Дневна и Нощна тема с автоматична промяна на картата.
@@ -1252,7 +1290,7 @@ fun MainScreen() {
 
                                     🌟 Features:
                                     • Darkened icon visual indication for selected spots.
-                                    • Built-in GPS & Compass Guidance with direct line overlay and live orientation arrow.
+                                    • Built-in GPS & Compass Guidance with OSRM street-level routing.
                                     • Dynamic compass and real-time device map orientation.
                                     • Search radius adjustment from 1.0 to 5.0 km.
                                     • Day / Night mode with automatic map contrast adjustment.
