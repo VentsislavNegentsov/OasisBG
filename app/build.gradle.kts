@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.oasisbg"
+    namespace = "com.spotnaut"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.oasisbg"
+        applicationId = "com.spotnaut"
         minSdk = 24
         targetSdk = 35
         versionCode = 1

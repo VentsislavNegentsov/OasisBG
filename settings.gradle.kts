@@ -22,6 +22,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Oasis Urban City Spot Map"
+rootProject.name = "SpotNaut"
 include(":app")
  

@@ -1,4 +1,4 @@
-package com.oasisbg
+package com.spotnaut
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -218,7 +218,7 @@ interface OverpassApi {
                 .readTimeout(10, TimeUnit.SECONDS)
                 .addInterceptor { chain ->
                     val request = chain.request().newBuilder()
-                        .header("User-Agent", "OasisUrban-CitySpotMap/3.9 (Android)")
+                        .header("User-Agent", "SpotNaut/1.0 (Android)")
                         .build()
                     chain.proceed(request)
                 }
@@ -454,7 +454,7 @@ suspend fun fetchStreetRouteDetails(start: GeoPoint, target: GeoPoint): Navigati
 
         NavigationData(coords, steps)
     } catch (e: Exception) {
-        Log.e("OasisUrban", "Грешка при извличане на маршрут", e)
+        Log.e("SpotNaut", "Грешка при извличане на маршрут", e)
         NavigationData(listOf(start, target), emptyList())
     }
 }
@@ -648,7 +648,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MainScreen() {
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("OasisUrbanPrefs", Context.MODE_PRIVATE) }
+    val prefs = remember { context.getSharedPreferences("SpotNautPrefs", Context.MODE_PRIVATE) }
 
     var isDarkMode by remember { mutableStateOf(prefs.getBoolean("is_dark_mode", false)) }
 
@@ -762,7 +762,7 @@ fun MainScreen() {
                 locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 800L, 0.5f, listener)
                 locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 1000L, 1.0f, listener)
             } catch (e: SecurityException) {
-                Log.e("OasisUrban", "Location permission missing", e)
+                Log.e("SpotNaut", "Location permission missing", e)
             }
 
             onDispose { locationManager.removeUpdates(listener) }
@@ -1041,7 +1041,7 @@ fun MainScreen() {
                 } catch (e: CancellationException) {
                     // Canceled
                 } catch (e: Exception) {
-                    Log.e("OasisUrban", "Error", e)
+                    Log.e("SpotNaut", "Error", e)
                     Toast.makeText(context, e.localizedMessage, Toast.LENGTH_LONG).show()
                 } finally {
                     isLoading = false
@@ -1470,7 +1470,7 @@ fun MainScreen() {
                     onDismissRequest = { showAboutDialog = false },
                     title = {
                         Column {
-                            Text("Oasis Urban: City Spot Map", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                            Text("SpotNaut", fontWeight = FontWeight.Bold, fontSize = 18.sp)
                             Text("by Ventsislav Negentsov", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.primary)
                         }
                     },
@@ -1479,7 +1479,7 @@ fun MainScreen() {
                             Text(
                                 text = if (currentLanguage == AppLanguage.BG) {
                                     """
-                                    Oasis Urban: City Spot Map е твоят интерактивен градски помощник.
+                                    SpotNaut е твоят интерактивен градски помощник.
 
                                     🌟 Възможности:
                                     • Automotive Navigation с векторни стрелки за завои и кръгови кръстовища.
@@ -1490,7 +1490,7 @@ fun MainScreen() {
                                     """.trimIndent()
                                 } else {
                                     """
-                                    Oasis Urban: City Spot Map is your interactive urban companion.
+                                    SpotNaut is your interactive urban companion.
 
                                     🌟 Features:
                                     • Automotive HUD Navigation with vector maneuver arrows.

@@ -1,4 +1,4 @@
-package com.oasisbg.ui.theme
+package com.spotnaut.ui.theme
 
 import androidx.compose.material3.Typography
 import androidx.compose.ui.text.TextStyle

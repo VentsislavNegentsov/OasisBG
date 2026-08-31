@@ -1,4 +1,4 @@
-package com.oasisbg
+package com.spotnaut
 
 import org.junit.Test
 

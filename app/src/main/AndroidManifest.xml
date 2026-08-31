@@ -22,7 +22,7 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.OasisUrban">
+        android:theme="@style/Theme.SpotNaut">
 
         <activity
             android:name=".MainActivity"
